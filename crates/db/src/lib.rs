@@ -86,6 +86,14 @@ impl Db {
         &self.pool
     }
 
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .context("PostgreSQL ping failed")?;
+        Ok(())
+    }
+
     pub async fn next_derivation_index(&self, network: Network) -> Result<i32> {
         let row: Option<(i32,)> = sqlx::query_as(
             r#"SELECT "derivationIndex" FROM deposit_addresses WHERE network = $1::"Network" ORDER BY "derivationIndex" DESC LIMIT 1"#,

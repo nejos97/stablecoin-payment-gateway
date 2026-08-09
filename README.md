@@ -24,7 +24,7 @@ cargo run -p gateway
 
 On first boot the binary applies SQL migrations (`crates/db/migrations`) via sqlx.
 
-API: `http://localhost:3000` — `GET /healthz`
+API: `http://localhost:3000` — `GET /healthz` (liveness), `GET /readyz` (Postgres + Redis)
 
 ### Docker
 
@@ -44,7 +44,7 @@ There are no integration tests for the API or chain providers yet.
 
 ## Authentication
 
-If `API_SECRET` is set, all endpoints except `GET /healthz` require:
+If `API_SECRET` is set, all endpoints except `GET /healthz` and `GET /readyz` require:
 
 ```
 X-API-SECRET: <API_SECRET>

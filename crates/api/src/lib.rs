@@ -1,3 +1,5 @@
+use std::time::Duration as StdDuration;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -13,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
 
+const READINESS_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+
 pub fn router(state: AppState) -> Router {
     let api_v1 = Router::new()
         .route(
@@ -25,6 +29,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .nest("/api/v1", api_v1)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -32,6 +37,50 @@ pub fn router(state: AppState) -> Router {
 
 async fn healthz() -> Json<Value> {
     Json(json!({ "status": "OK" }))
+}
+
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let (postgres, redis) = tokio::join!(check_postgres(&state), check_redis(&state));
+
+    let ready = postgres == "ok" && redis == "ok";
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "checks": {
+                "postgres": postgres,
+                "redis": redis,
+            }
+        })),
+    )
+}
+
+async fn check_postgres(state: &AppState) -> String {
+    match tokio::time::timeout(READINESS_TIMEOUT, state.db.ping()).await {
+        Ok(Ok(())) => "ok".into(),
+        Ok(Err(e)) => format!("error: {e:#}"),
+        Err(_) => "timeout".into(),
+    }
+}
+
+async fn check_redis(state: &AppState) -> String {
+    let mut redis = state.redis.clone();
+    match tokio::time::timeout(
+        READINESS_TIMEOUT,
+        redis::cmd("PING").query_async::<String>(&mut redis),
+    )
+    .await
+    {
+        Ok(Ok(_)) => "ok".into(),
+        Ok(Err(e)) => format!("error: {e}"),
+        Err(_) => "timeout".into(),
+    }
 }
 
 async fn create_deposit_address(
