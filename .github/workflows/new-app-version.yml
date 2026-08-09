@@ -1,5 +1,5 @@
-# Manually bump the workspace SemVer, commit, and push a matching git tag.
-# The tag push triggers docker-publish.yml.
+# Manually bump the workspace SemVer, commit, push a matching git tag,
+# then publish the Docker image (via reusable workflow).
 
 name: New App Version
 
@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout project repo
         uses: actions/checkout@v4
@@ -63,3 +65,14 @@ jobs:
           git tag "v${VERSION}"
           git push origin HEAD
           git push origin "v${VERSION}"
+
+  docker:
+    name: Publish Docker image
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      tag: v${{ needs.release.outputs.version }}
+    secrets: inherit
