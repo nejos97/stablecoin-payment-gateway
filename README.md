@@ -1,6 +1,6 @@
 # Stablecoin Payment Service
 
-Rust microservice for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**.
+Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**.
 
 ## Features
 
@@ -135,13 +135,6 @@ If `WEBHOOK_CALLBACK_URL` is not set, a warning is logged at startup and webhook
 \* Required for monitoring on the respective network.
 
 Advanced overrides (code defaults if unset): `DEPOSIT_EXPIRY_MINUTES` (30), `POLLING_INTERVAL_SECONDS` (10), `ETH_CONFIRMATIONS` (12), `TRON_CONFIRMATIONS` (19), `AMOUNT_TOLERANCE_PERCENT` (1).
-
-## Workspace layout
-
-```
-crates/
-  config/   domain/   wallet/   db/   chain/   jobs/   api/   gateway/
-```
 
 ## USDT contracts
 
