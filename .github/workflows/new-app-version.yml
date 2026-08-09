@@ -1,0 +1,65 @@
+# Manually bump the workspace SemVer, commit, and push a matching git tag.
+# The tag push triggers docker-publish.yml.
+
+name: New App Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-type:
+        type: choice
+        description: 'Release type (one of): patch, minor, major'
+        required: true
+        default: 'patch'
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  release:
+    name: Create New Version and push new tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout project repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git User Setup
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-edit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Bump workspace version
+        run: cargo set-version --workspace --bump ${{ inputs.release-type }}
+
+      - name: Refresh lockfile metadata
+        run: cargo metadata --no-deps --format-version 1 > /dev/null
+
+      - name: Resolve new version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "gateway") | .version')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "New version: ${VERSION}"
+
+      - name: Commit, tag and push
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release v${VERSION}"
+          git tag "v${VERSION}"
+          git push origin HEAD
+          git push origin "v${VERSION}"

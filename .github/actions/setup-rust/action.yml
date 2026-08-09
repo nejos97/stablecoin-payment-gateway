@@ -1,0 +1,11 @@
+# Composite action shared by CI and release workflows.
+name: 'Setup Rust'
+description: 'Install Rust toolchain and enable cargo cache'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
