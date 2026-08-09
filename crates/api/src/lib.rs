@@ -14,15 +14,18 @@ use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
+    let api_v1 = Router::new()
         .route(
             "/deposit-addresses",
             post(create_deposit_address).get(list_deposit_addresses),
         )
         .route("/deposit-addresses/{id}", get(get_deposit_address))
         .route("/balances", get(get_balances))
-        .route("/wallet-balances", get(get_wallet_balances))
+        .route("/wallet-balances", get(get_wallet_balances));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .nest("/api/v1", api_v1)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

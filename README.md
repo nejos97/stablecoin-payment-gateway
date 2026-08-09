@@ -6,7 +6,7 @@ Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana
 
 ## Features
 
-- Create unique deposit addresses per payment (`POST /deposit-addresses`)
+- Create unique deposit addresses per payment (`POST /api/v1/deposit-addresses`)
 - Monitor blockchain transfers and confirm deposits
 - Send webhooks to a global `WEBHOOK_CALLBACK_URL` when deposits are confirmed
 - HD wallet derivation from `WALLET_MNEMONIC`
@@ -56,7 +56,7 @@ If `API_SECRET` is empty or unset, authentication is disabled.
 ### Create deposit address
 
 ```bash
-curl -X POST http://localhost:3000/deposit-addresses \
+curl -X POST http://localhost:3000/api/v1/deposit-addresses \
   -H "Content-Type: application/json" \
   -H "X-API-SECRET: change-me-to-a-long-random-secret" \
   -d '{
@@ -69,7 +69,7 @@ curl -X POST http://localhost:3000/deposit-addresses \
 ### List deposit addresses
 
 ```bash
-curl "http://localhost:3000/deposit-addresses?status=pending&limit=20" \
+curl "http://localhost:3000/api/v1/deposit-addresses?status=pending&limit=20" \
   -H "X-API-SECRET: change-me-to-a-long-random-secret"
 ```
 
@@ -83,21 +83,21 @@ Query params (optional):
 ### Get deposit address status
 
 ```bash
-curl http://localhost:3000/deposit-addresses/<id> \
+curl http://localhost:3000/api/v1/deposit-addresses/<id> \
   -H "X-API-SECRET: change-me-to-a-long-random-secret"
 ```
 
 ### Get USDT balances (deposit addresses in database)
 
 ```bash
-curl http://localhost:3000/balances \
+curl http://localhost:3000/api/v1/balances \
   -H "X-API-SECRET: change-me-to-a-long-random-secret"
 ```
 
 ### Get HD wallet balances (cached, synced hourly)
 
 ```bash
-curl http://localhost:3000/wallet-balances \
+curl http://localhost:3000/api/v1/wallet-balances \
   -H "X-API-SECRET: change-me-to-a-long-random-secret"
 ```
 
