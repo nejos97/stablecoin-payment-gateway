@@ -1,5 +1,7 @@
 # Stablecoin Payment Service
 
+[![CI](https://github.com/nejos97/stablecoin-payment-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/nejos97/stablecoin-payment-gateway/actions/workflows/ci.yml)
+
 Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**.
 
 ## Features
@@ -29,6 +31,16 @@ API: `http://localhost:3000` — `GET /healthz`
 ```bash
 docker compose up --build
 ```
+
+## Testing
+
+Unit tests live in the `domain` and `wallet` crates (BIP39 / HD address golden vectors, amount tolerance, network roundtrip). CI runs the same suite:
+
+```bash
+cargo test -p domain -p wallet
+```
+
+There are no integration tests for the API or chain providers yet.
 
 ## Authentication
 
@@ -111,6 +123,23 @@ Sent to `WEBHOOK_CALLBACK_URL` on confirmed deposit:
 ```
 
 If `WEBHOOK_CALLBACK_URL` is not set, a warning is logged at startup and webhooks are disabled.
+
+## Security considerations
+
+This service uses a **custodial hot wallet**: a single operator `WALLET_MNEMONIC` is loaded at boot and used to derive all deposit addresses (HD paths per network). Compromising the host or the environment secret means compromising the entire derivation chain and any funds sitting on those addresses.
+
+Treat production deployments accordingly:
+
+- Store the mnemonic in a secret manager or HSM/KMS — not in plain files on disk or in git
+- Plan key rotation before you accumulate significant balances
+- Always set a strong `API_SECRET` in production
+- Never log the mnemonic; keep `.env` out of version control
+
+[`.env.example`](.env.example) uses only the well-known BIP39 test vector (`abandon … about`). Do not reuse it with real funds.
+
+Scope today: inbound USDT deposit detection and webhooks. This is not a multi-tenant or non-custodial vault.
+
+To report a vulnerability, use [GitHub Security Advisories](https://github.com/nejos97/stablecoin-payment-gateway/security/advisories/new) rather than a public issue when possible.
 
 ## Environment variables
 
