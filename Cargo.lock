@@ -94,7 +94,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "chain"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rust_decimal",
  "rust_decimal_macros",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "api",
@@ -2057,7 +2057,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jobs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chain",
@@ -5978,7 +5978,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wallet"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bip39",
