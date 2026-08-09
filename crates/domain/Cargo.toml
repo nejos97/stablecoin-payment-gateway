@@ -1,0 +1,14 @@
+[package]
+name = "domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rust_decimal.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rust_decimal = { workspace = true, features = ["macros"] }
+rust_decimal_macros = "1"

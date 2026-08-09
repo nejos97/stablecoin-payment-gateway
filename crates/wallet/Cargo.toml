@@ -1,0 +1,23 @@
+[package]
+name = "wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bip39.workspace = true
+bs58.workspace = true
+domain = { workspace = true }
+ed25519-dalek.workspace = true
+hex.workspace = true
+hmac.workspace = true
+k256.workspace = true
+pbkdf2.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+solana-sdk.workspace = true
+spl-associated-token-account.workspace = true
+spl-token.workspace = true
+thiserror.workspace = true
+tiny-hderive.workspace = true

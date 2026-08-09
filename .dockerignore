@@ -1,0 +1,12 @@
+target
+.git
+.github
+.env
+.env.*
+!.env.example
+docker-compose*
+README.md
+docs/
+.DS_Store
+*.md
+.cargo
