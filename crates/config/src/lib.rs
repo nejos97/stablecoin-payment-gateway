@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 pub const APP_NAME: &str = "stablecoin-payment-service";
@@ -24,7 +24,6 @@ pub struct AppConfig {
     pub port: u16,
     pub app_env: String,
     pub log_level: String,
-    pub api_secret: Option<String>,
     pub wallet_mnemonic: String,
     pub database_url: String,
     pub redis_url: String,
@@ -49,13 +48,6 @@ impl AppConfig {
         load_dotenv();
 
         let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".into());
-        let api_secret = optional("API_SECRET");
-        if let Some(ref secret) = api_secret {
-            if secret.len() < 8 {
-                bail!("API_SECRET must be at least 8 characters when set");
-            }
-        }
-
         let wallet_mnemonic = required("WALLET_MNEMONIC")?;
         let database_url = required("DATABASE_URL")?;
         let redis_url = required("REDIS_URL")?;
@@ -68,7 +60,6 @@ impl AppConfig {
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
             redis_prefix: format!("{APP_NAME}-{app_env}"),
             app_env,
-            api_secret,
             wallet_mnemonic,
             database_url,
             redis_url,

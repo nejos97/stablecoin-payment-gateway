@@ -20,7 +20,7 @@ Cargo workspace of 8 crates under `crates/` (version, edition, and all dependenc
 | `db` | `Db` wrapper over a `PgPool`, row structs, all SQL queries, sqlx migrations (`crates/db/migrations/`) |
 | `chain` | HTTP clients for TronGrid, Alchemy (Ethereum JSON-RPC), Helius (Solana): transfer polling + USDT balance fetches, Tron rate-limit backoff |
 | `jobs` | `AppState` (shared by API + workers), background workers (`spawn_workers`): one monitor loop per network, webhook delivery loop, hourly wallet-balance sync; deposit confirmation logic (`process_detected_transfer`) |
-| `api` | Axum router: `/healthz`, `/readyz`, and `/api/v1/*` endpoints; `X-API-SECRET` auth (`require_secret`, constant-time compare); `ApiError` (`{"statusCode": ..., "message": ...}`) |
+| `api` | Axum router: `/healthz`, `/readyz`, and `/api/v1/*` endpoints; `ApiError` (`{"statusCode": ..., "message": ...}`) |
 | `gateway` | The binary. Wires config → wallet → db (+ migrations) → redis → chain → workers → HTTP server |
 
 Dependency direction: `domain` ← everything; `api` and `jobs` sit on top; only `gateway` produces a binary. Put logic in the right layer — e.g. queue/DB logic belongs in `jobs`/`db`, not in API handlers.
@@ -49,11 +49,11 @@ Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as 
 - **Redis keys** are always built via `config.redis_key(suffix)` → `stablecoin-payment-service-{APP_ENV}:{suffix}`. Never hardcode a full key.
 - **Config**: all tuning goes through env vars read in `crates/config/src/lib.rs` (with defaults) and documented in the README table. Missing provider API keys must *disable* the corresponding network with a startup warning, not crash.
 - Errors: `anyhow` at boundaries, `thiserror` enums inside `domain`/`wallet`. API errors go through `ApiError` so the JSON shape stays `{"statusCode", "message"}`.
-- Logging via `tracing`. **Never log the mnemonic, API secrets, or provider API keys.**
+- Logging via `tracing`. **Never log the mnemonic or provider API keys.**
 
 ## Domain gotchas (easy to get wrong)
 
-- **ID confusion in webhooks**: the webhook JSON field `data.deposit_id` is actually `deposit_addresses.id`, while the Redis queue and `webhook_deliveries.depositId` hold `deposits.id`. This is intentional and load-bearing for existing receivers — do not "fix" the payload. See [docs/webhook-retrigger.md](docs/webhook-retrigger.md).
+- **ID confusion in webhooks**: the webhook JSON field `data.deposit_id` is actually `deposit_addresses.id`, while the Redis queue and `webhook_deliveries.depositId` hold `deposits.id`. This is intentional and load-bearing for existing receivers — do not "fix" the payload.
 - **Confirmation thresholds**: Tron 19, Ethereum 12 (env-overridable), Solana hardcoded to 1 (`domain::required_confirmations`).
 - **Webhook delivery**: max 5 attempts (`WEBHOOK_MAX_ATTEMPTS`), ~2s loop, 10s HTTP timeout, no exponential backoff, only the *last* response/error is stored. A deposit's webhook is enqueued once at confirmation; already-`DELIVERED` deposits are skipped.
 - Two independent status machines: deposit (`DETECTED` → `CONFIRMED`) tracks on-chain state; webhook (`PENDING`/`DELIVERED`/`FAILED`) tracks HTTP notification state. Never let one mutate the other.
@@ -62,14 +62,13 @@ Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as 
 
 ## Specs in `docs/`
 
-Files in `docs/` may be full implementation specs (currently [docs/webhook-retrigger.md](docs/webhook-retrigger.md)). If a task relates to one, **read the whole spec first and follow it exactly**, including its "out of scope" list.
+Files in `docs/` may be full implementation specs. If a task relates to one, **read the whole spec first and follow it exactly**, including its "out of scope" list.
 
 ## Security rules
 
 This is a **custodial hot-wallet** service — treat everything key-related as sensitive:
 
 - Never commit `.env`, real mnemonics, API keys, or production credentials. `.env.example` only uses the well-known BIP39 test vector (`abandon … about`).
-- Don't weaken auth: `require_secret` protects every `/api/v1` route (only `/healthz` and `/readyz` are open); the secret comparison is constant-time on purpose.
 - Address derivation must remain deterministic — changing paths or hashing breaks recovery of funds on already-issued addresses.
 
 ## Git / CI / releases

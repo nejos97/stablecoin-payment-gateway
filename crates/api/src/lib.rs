@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
-use config::AppConfig;
 use db::{DepositAddressRow, WebhookDeliveryRow};
 use domain::{DepositAddressStatus, Network, Token, WebhookDeliveryStatus};
 use jobs::{get_cached_wallet_balances, get_live_balances, retrigger_webhook, AppState, RetriggerError};
@@ -90,11 +89,8 @@ async fn check_redis(state: &AppState) -> String {
 
 async fn create_deposit_address(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<CreateDepositAddressRequest>,
 ) -> Result<(StatusCode, Json<DepositAddressResponse>), ApiError> {
-    require_secret(&headers, &state.config)?;
-
     let network = Network::parse_api(&body.network).map_err(ApiError::from)?;
     let token = Token::parse_api(&body.token).map_err(ApiError::from)?;
     let expected: Decimal = body
@@ -135,10 +131,8 @@ async fn create_deposit_address(
 
 async fn list_deposit_addresses(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    require_secret(&headers, &state.config)?;
     let _ = state.db.expire_stale_addresses().await?;
 
     let status = query
@@ -176,10 +170,8 @@ async fn list_deposit_addresses(
 
 async fn get_deposit_address(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    require_secret(&headers, &state.config)?;
     let Some(row) = state.db.find_deposit_address(&id).await? else {
         return Err(ApiError::not_found(format!(
             "Deposit address not found: {id}"
@@ -241,10 +233,8 @@ fn webhook_to_json(delivery: &WebhookDeliveryRow) -> Value {
 
 async fn retry_deposit_webhook(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(deposit_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    require_secret(&headers, &state.config)?;
     match retrigger_webhook(&state, &deposit_id).await {
         Ok(()) => Ok(Json(json!({
             "status": "queued",
@@ -263,56 +253,14 @@ async fn retry_deposit_webhook(
     }
 }
 
-async fn get_balances(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    require_secret(&headers, &state.config)?;
+async fn get_balances(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let resp = get_live_balances(&state).await?;
     Ok(Json(serde_json::to_value(resp)?))
 }
 
-async fn get_wallet_balances(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    require_secret(&headers, &state.config)?;
+async fn get_wallet_balances(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let resp = get_cached_wallet_balances(&state).await?;
     Ok(Json(serde_json::to_value(resp)?))
-}
-
-fn require_secret(headers: &HeaderMap, config: &AppConfig) -> Result<(), ApiError> {
-    let Some(expected) = config.api_secret.as_deref() else {
-        // Auth disabled when API_SECRET is unset / empty
-        return Ok(());
-    };
-
-    let provided = headers
-        .get("x-api-secret")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !secrets_match(provided, expected) {
-        return Err(ApiError::unauthorized(
-            "Invalid or missing API secret".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn secrets_match(provided: &str, expected: &str) -> bool {
-    use std::cmp;
-    let a = provided.as_bytes();
-    let b = expected.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    // touch lengths to avoid trivial timing on empty
-    let _ = cmp::max(a.len(), b.len());
-    diff == 0
 }
 
 fn to_response(row: &DepositAddressRow) -> Result<DepositAddressResponse, ApiError> {
@@ -374,12 +322,6 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn unauthorized(message: String) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message,
-        }
-    }
     fn not_found(message: String) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,

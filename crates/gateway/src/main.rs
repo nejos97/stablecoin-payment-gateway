@@ -24,9 +24,6 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
-    if config.api_secret.is_none() {
-        tracing::warn!("API_SECRET is not set — API authentication disabled");
-    }
     if config.webhook_callback_url.is_none() {
         tracing::warn!("WEBHOOK_CALLBACK_URL is not set — webhooks disabled");
     }
