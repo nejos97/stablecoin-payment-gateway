@@ -7,6 +7,11 @@ use serde::Deserialize;
 pub const APP_NAME: &str = "stablecoin-payment-service";
 pub const USDT_DECIMALS: u32 = 6;
 pub const WEBHOOK_MAX_ATTEMPTS: u32 = 5;
+/// Gaps between webhook attempts, indexed by `attempts - 1` after a failed
+/// attempt. Geometric ratio 3; the gaps sum to 3600s so the 5th and final
+/// attempt starts ~1h after the 1st. Length must stay WEBHOOK_MAX_ATTEMPTS - 1.
+pub const WEBHOOK_RETRY_DELAYS_SECS: [u64; 4] = [90, 270, 810, 2430];
+const _: () = assert!(WEBHOOK_RETRY_DELAYS_SECS.len() == WEBHOOK_MAX_ATTEMPTS as usize - 1);
 pub const WALLET_BALANCE_SYNC_INTERVAL_SECS: u64 = 60 * 60;
 pub const ADDRESS_REQUEST_DELAY_MS: u64 = 300;
 
@@ -169,4 +174,19 @@ fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webhook_retry_delays_span_one_hour() {
+        assert_eq!(
+            WEBHOOK_RETRY_DELAYS_SECS.len(),
+            WEBHOOK_MAX_ATTEMPTS as usize - 1
+        );
+        assert_eq!(WEBHOOK_RETRY_DELAYS_SECS.iter().sum::<u64>(), 3600);
+        assert!(WEBHOOK_RETRY_DELAYS_SECS.windows(2).all(|w| w[0] < w[1]));
+    }
 }

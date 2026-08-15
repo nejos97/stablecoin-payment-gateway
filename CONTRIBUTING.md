@@ -22,10 +22,10 @@ Never commit a real `.env`. Keep secrets and production mnemonics out of the rep
 ## Tests
 
 ```bash
-cargo test -p domain -p wallet
+cargo test -p domain -p wallet -p config -p jobs
 ```
 
-This matches what CI runs. Prefer small, focused PRs with tests when you change `domain` or `wallet` logic.
+This matches what CI runs. Prefer small, focused PRs with tests when you change `domain`, `wallet`, `config`, or `jobs` logic.
 
 ## Pull requests
 

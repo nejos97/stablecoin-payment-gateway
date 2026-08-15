@@ -34,10 +34,10 @@ docker compose up --build
 
 ## Testing
 
-Unit tests live in the `domain` and `wallet` crates (BIP39 / HD address golden vectors, amount tolerance, network roundtrip). CI runs the same suite:
+Unit tests live in the `domain`, `wallet`, `config`, and `jobs` crates (BIP39 / HD address golden vectors, amount tolerance, enum roundtrips, webhook retry schedule). CI runs the same suite:
 
 ```bash
-cargo test -p domain -p wallet
+cargo test -p domain -p wallet -p config -p jobs
 ```
 
 There are no integration tests for the API or chain providers yet.
@@ -87,6 +87,17 @@ curl http://localhost:3000/api/v1/deposit-addresses/<id> \
   -H "X-API-SECRET: change-me-to-a-long-random-secret"
 ```
 
+Each entry in the returned `deposits[]` includes a `webhook` object with the delivery state (`status`: `pending` / `delivered` / `failed`, `attempts`, `last_response`, `last_error`, `updated_at`), or `null` if no delivery was attempted yet.
+
+### Retry a webhook delivery
+
+```bash
+curl -X POST http://localhost:3000/api/v1/deposits/<deposit_id>/webhooks/retry \
+  -H "X-API-SECRET: change-me-to-a-long-random-secret"
+```
+
+`<deposit_id>` is the `id` of an entry in `deposits[]` above. Retry resets the delivery attempts and re-queues the webhook; the payload is unchanged and the deposit status is unchanged. Errors: `404` unknown deposit, `400` deposit not confirmed, `503` `WEBHOOK_CALLBACK_URL` not set.
+
 ### Get USDT balances (deposit addresses in database)
 
 ```bash
@@ -123,6 +134,8 @@ Sent to `WEBHOOK_CALLBACK_URL` on confirmed deposit:
 ```
 
 If `WEBHOOK_CALLBACK_URL` is not set, a warning is logged at startup and webhooks are disabled.
+
+Delivery is attempted up to 5 times with increasing gaps — 90s, 4m30, 13m30, 40m30 — so the 5th and final attempt starts ~1h after the first. After that the delivery is marked `failed` and can only be resent via the retry endpoint. Receivers must treat replays as the same event (idempotent on their side).
 
 ## Security considerations
 

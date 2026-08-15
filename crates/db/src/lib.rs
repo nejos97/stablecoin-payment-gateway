@@ -13,6 +13,14 @@ pub struct Db {
     pool: PgPool,
 }
 
+// sqlx refuses to decode a Postgres enum column into a Rust String, and a
+// TIMESTAMP(3) column into DateTime<Utc>, so every query that materializes a
+// row must cast enums to text and timestamps to timestamptz (stored values
+// are UTC instants) instead of using SELECT * / RETURNING *.
+const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
+const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+
 #[derive(Debug, Clone, FromRow)]
 pub struct DepositAddressRow {
     pub id: String,
@@ -62,6 +70,10 @@ pub struct WebhookDeliveryRow {
     pub last_response: Option<i32>,
     #[sqlx(rename = "lastError")]
     pub last_error: Option<String>,
+    #[sqlx(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[sqlx(rename = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
 }
 
 impl Db {
@@ -126,15 +138,15 @@ impl Db {
     ) -> Result<DepositAddressRow> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let row = sqlx::query_as::<_, DepositAddressRow>(
+        let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
             INSERT INTO deposit_addresses
               (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt")
             VALUES
               ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9)
-            RETURNING *
-            "#,
-        )
+            RETURNING {DEPOSIT_ADDRESS_COLUMNS}
+            "#
+        ))
         .bind(&id)
         .bind(network.as_db())
         .bind(token.as_db())
@@ -159,15 +171,15 @@ impl Db {
         let status_db = status.map(|s| s.as_db().to_string());
         let network_db = network.map(|n| n.as_db().to_string());
 
-        let rows = sqlx::query_as::<_, DepositAddressRow>(
+        let rows = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
-            SELECT * FROM deposit_addresses
+            SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses
             WHERE ($1::text IS NULL OR status = $1::"DepositAddressStatus")
               AND ($2::text IS NULL OR network = $2::"Network")
             ORDER BY "createdAt" DESC
             LIMIT $3 OFFSET $4
-            "#,
-        )
+            "#
+        ))
         .bind(status_db.as_deref())
         .bind(network_db.as_deref())
         .bind(limit)
@@ -191,9 +203,9 @@ impl Db {
     }
 
     pub async fn find_deposit_address(&self, id: &str) -> Result<Option<DepositAddressRow>> {
-        let row = sqlx::query_as::<_, DepositAddressRow>(
-            r#"SELECT * FROM deposit_addresses WHERE id = $1"#,
-        )
+        let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
+            "SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses WHERE id = $1"
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -201,9 +213,9 @@ impl Db {
     }
 
     pub async fn list_deposits_for_address(&self, address_id: &str) -> Result<Vec<DepositRow>> {
-        let rows = sqlx::query_as::<_, DepositRow>(
-            r#"SELECT * FROM deposits WHERE "depositAddressId" = $1 ORDER BY "detectedAt" DESC"#,
-        )
+        let rows = sqlx::query_as::<_, DepositRow>(&format!(
+            r#"SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE "depositAddressId" = $1 ORDER BY "detectedAt" DESC"#
+        ))
         .bind(address_id)
         .fetch_all(&self.pool)
         .await?;
@@ -224,14 +236,14 @@ impl Db {
     }
 
     pub async fn pending_addresses(&self, network: Network) -> Result<Vec<DepositAddressRow>> {
-        let rows = sqlx::query_as::<_, DepositAddressRow>(
+        let rows = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
-            SELECT * FROM deposit_addresses
+            SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses
             WHERE network = $1::"Network"
               AND status = 'PENDING'::"DepositAddressStatus"
               AND "expiresAt" > NOW()
-            "#,
-        )
+            "#
+        ))
         .bind(network.as_db())
         .fetch_all(&self.pool)
         .await?;
@@ -249,9 +261,9 @@ impl Db {
     }
 
     pub async fn find_deposit_by_tx(&self, tx_hash: &str) -> Result<Option<DepositRow>> {
-        let row = sqlx::query_as::<_, DepositRow>(
-            r#"SELECT * FROM deposits WHERE "txHash" = $1"#,
-        )
+        let row = sqlx::query_as::<_, DepositRow>(&format!(
+            r#"SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE "txHash" = $1"#
+        ))
         .bind(tx_hash)
         .fetch_optional(&self.pool)
         .await?;
@@ -259,10 +271,12 @@ impl Db {
     }
 
     pub async fn find_deposit(&self, id: &str) -> Result<Option<DepositRow>> {
-        let row = sqlx::query_as::<_, DepositRow>(r#"SELECT * FROM deposits WHERE id = $1"#)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query_as::<_, DepositRow>(&format!(
+            "SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
@@ -278,9 +292,9 @@ impl Db {
     ) -> Result<DepositRow> {
         let mut tx = self.pool.begin().await?;
 
-        let existing = sqlx::query_as::<_, DepositRow>(
-            r#"SELECT * FROM deposits WHERE "txHash" = $1 FOR UPDATE"#,
-        )
+        let existing = sqlx::query_as::<_, DepositRow>(&format!(
+            r#"SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE "txHash" = $1 FOR UPDATE"#
+        ))
         .bind(tx_hash)
         .fetch_optional(&mut *tx)
         .await?;
@@ -291,16 +305,16 @@ impl Db {
             } else {
                 existing.confirmed_at
             };
-            sqlx::query_as::<_, DepositRow>(
+            sqlx::query_as::<_, DepositRow>(&format!(
                 r#"
                 UPDATE deposits
                 SET confirmations = $2,
                     status = $3::"DepositStatus",
                     "confirmedAt" = $4
                 WHERE id = $1
-                RETURNING *
-                "#,
-            )
+                RETURNING {DEPOSIT_COLUMNS}
+                "#
+            ))
             .bind(&existing.id)
             .bind(confirmations)
             .bind(status.as_db())
@@ -314,15 +328,15 @@ impl Db {
             } else {
                 None
             };
-            sqlx::query_as::<_, DepositRow>(
+            sqlx::query_as::<_, DepositRow>(&format!(
                 r#"
                 INSERT INTO deposits
                   (id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status, "detectedAt", "confirmedAt")
                 VALUES
                   ($1, $2, $3, $4, $5, $6, $7::"DepositStatus", NOW(), $8)
-                RETURNING *
-                "#,
-            )
+                RETURNING {DEPOSIT_COLUMNS}
+                "#
+            ))
             .bind(&id)
             .bind(deposit_address_id)
             .bind(tx_hash)
@@ -369,27 +383,97 @@ impl Db {
         &self,
         deposit_id: &str,
     ) -> Result<WebhookDeliveryRow> {
-        if let Some(row) = sqlx::query_as::<_, WebhookDeliveryRow>(
-            r#"SELECT * FROM webhook_deliveries WHERE "depositId" = $1 ORDER BY "createdAt" DESC LIMIT 1"#,
-        )
-        .bind(deposit_id)
-        .fetch_optional(&self.pool)
-        .await?
-        {
+        if let Some(row) = self.find_webhook_delivery_by_deposit_id(deposit_id).await? {
             return Ok(row);
         }
 
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let row = sqlx::query_as::<_, WebhookDeliveryRow>(
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
             r#"
             INSERT INTO webhook_deliveries
               (id, "depositId", status, attempts, "createdAt", "updatedAt")
             VALUES
               ($1, $2, 'PENDING'::"WebhookDeliveryStatus", 0, $3, $3)
-            RETURNING id, "depositId", status, attempts, "lastResponse", "lastError"
-            "#,
-        )
+            RETURNING {WEBHOOK_DELIVERY_COLUMNS}
+            "#
+        ))
+        .bind(&id)
+        .bind(deposit_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Most recent `webhook_deliveries` row for a deposit. `depositId` has no
+    /// UNIQUE constraint, so several rows may exist; the newest one is the
+    /// authoritative one (same convention as `get_or_create_webhook_delivery`).
+    pub async fn find_webhook_delivery_by_deposit_id(
+        &self,
+        deposit_id: &str,
+    ) -> Result<Option<WebhookDeliveryRow>> {
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"SELECT {WEBHOOK_DELIVERY_COLUMNS} FROM webhook_deliveries WHERE "depositId" = $1 ORDER BY "createdAt" DESC LIMIT 1"#
+        ))
+        .bind(deposit_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// All delivery rows for a set of deposits, newest first. Callers keep the
+    /// first row seen per deposit to get the authoritative one.
+    pub async fn find_webhook_deliveries_for_deposits(
+        &self,
+        deposit_ids: &[String],
+    ) -> Result<Vec<WebhookDeliveryRow>> {
+        if deposit_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"SELECT {WEBHOOK_DELIVERY_COLUMNS} FROM webhook_deliveries WHERE "depositId" = ANY($1) ORDER BY "createdAt" DESC"#
+        ))
+        .bind(deposit_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Reset the most recent delivery row to PENDING / 0 attempts (creating it
+    /// if none exists) so a manual retrigger restarts a full retry cycle.
+    /// Older historical rows are left untouched.
+    pub async fn reset_webhook_delivery(&self, deposit_id: &str) -> Result<WebhookDeliveryRow> {
+        if let Some(existing) = self.find_webhook_delivery_by_deposit_id(deposit_id).await? {
+            let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+                r#"
+                UPDATE webhook_deliveries
+                SET status = 'PENDING'::"WebhookDeliveryStatus",
+                    attempts = 0,
+                    "lastResponse" = NULL,
+                    "lastError" = NULL,
+                    "updatedAt" = NOW()
+                WHERE id = $1
+                RETURNING {WEBHOOK_DELIVERY_COLUMNS}
+                "#
+            ))
+            .bind(&existing.id)
+            .fetch_one(&self.pool)
+            .await?;
+            return Ok(row);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            INSERT INTO webhook_deliveries
+              (id, "depositId", status, attempts, "createdAt", "updatedAt")
+            VALUES
+              ($1, $2, 'PENDING'::"WebhookDeliveryStatus", 0, $3, $3)
+            RETURNING {WEBHOOK_DELIVERY_COLUMNS}
+            "#
+        ))
         .bind(&id)
         .bind(deposit_id)
         .bind(now)

@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chain::ChainClients;
-use config::{AppConfig, ADDRESS_REQUEST_DELAY_MS, WALLET_BALANCE_SYNC_INTERVAL_SECS, WEBHOOK_MAX_ATTEMPTS};
+use config::{
+    AppConfig, ADDRESS_REQUEST_DELAY_MS, WALLET_BALANCE_SYNC_INTERVAL_SECS, WEBHOOK_MAX_ATTEMPTS,
+    WEBHOOK_RETRY_DELAYS_SECS,
+};
 use db::Db;
 use domain::{
     raw_to_decimal, raw_to_decimal_string, required_confirmations, DetectedTransfer,
@@ -16,7 +19,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use wallet::WalletService;
 
-const WEBHOOK_QUEUE_KEY: &str = "queue:webhook-delivery";
+/// Legacy LIST queue, only drained at startup (pre-backoff deploys).
+const LEGACY_WEBHOOK_LIST_KEY: &str = "queue:webhook-delivery";
+/// ZSET scored by next-attempt epoch seconds. New suffix on purpose: a Redis
+/// key cannot change type in place (WRONGTYPE against the old LIST).
+const WEBHOOK_ZSET_KEY: &str = "zset:webhook-delivery";
 const WALLET_BALANCES_KEY: &str = "wallet-balances";
 
 #[derive(Clone)]
@@ -101,17 +108,79 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
     Ok(())
 }
 
-async fn enqueue_webhook(state: &AppState, deposit_id: &str) -> Result<()> {
-    let key = state.redis_key(WEBHOOK_QUEUE_KEY).await;
+/// Schedule a delivery attempt for "now". ZSET members are unique, so
+/// re-enqueueing a deposit that already has a scheduled retry simply moves it
+/// forward instead of adding a duplicate.
+pub async fn enqueue_webhook(state: &AppState, deposit_id: &str) -> Result<()> {
+    let key = state.config.redis_key(WEBHOOK_ZSET_KEY);
     let mut redis = state.redis.clone();
-    let _: () = redis.lpush(key, deposit_id).await?;
+    let _: () = redis
+        .zadd(key, deposit_id, chrono::Utc::now().timestamp())
+        .await?;
     Ok(())
 }
 
-pub async fn deliver_webhook(state: &AppState, deposit_id: &str) -> Result<()> {
+/// Gap before the next attempt once `attempts` HTTP attempts have been made.
+/// `None` when the retry budget is exhausted (or `attempts` is out of range).
+pub fn next_retry_delay_secs(attempts: i32) -> Option<u64> {
+    if attempts < 1 {
+        return None;
+    }
+    WEBHOOK_RETRY_DELAYS_SECS.get(attempts as usize - 1).copied()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// 2xx received now, or the row was already DELIVERED.
+    Delivered,
+    /// Attempt failed with retry budget left; `attempts` made so far.
+    RetryAt { attempts: i32 },
+    /// Attempt failed and the budget is exhausted; automatic retries stop.
+    Failed,
+    /// Nothing sent (WEBHOOK_CALLBACK_URL unset).
+    Skipped,
+}
+
+#[derive(Debug)]
+pub enum RetriggerError {
+    DepositNotFound,
+    DepositNotConfirmed,
+    WebhooksDisabled,
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for RetriggerError {
+    fn from(value: anyhow::Error) -> Self {
+        Self::Other(value)
+    }
+}
+
+/// Manual replay for the dashboard: reset the delivery row to PENDING / 0
+/// attempts, then schedule an immediate attempt. Never touches `deposits` or
+/// `deposit_addresses`.
+pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(), RetriggerError> {
+    let deposit = state
+        .db
+        .find_deposit(deposit_id)
+        .await?
+        .ok_or(RetriggerError::DepositNotFound)?;
+    if state.config.webhook_callback_url.is_none() {
+        return Err(RetriggerError::WebhooksDisabled);
+    }
+    if deposit.status != DepositStatus::Confirmed.as_db() {
+        return Err(RetriggerError::DepositNotConfirmed);
+    }
+
+    state.db.reset_webhook_delivery(&deposit.id).await?;
+    enqueue_webhook(state, &deposit.id).await?;
+    info!("Webhook retriggered for deposit {deposit_id}");
+    Ok(())
+}
+
+pub async fn deliver_webhook(state: &AppState, deposit_id: &str) -> Result<DeliveryOutcome> {
     let Some(webhook_url) = &state.config.webhook_callback_url else {
         warn!("Webhook delivery skipped — WEBHOOK_CALLBACK_URL is not set");
-        return Ok(());
+        return Ok(DeliveryOutcome::Skipped);
     };
 
     let Some(deposit) = state.db.find_deposit(deposit_id).await? else {
@@ -123,7 +192,7 @@ pub async fn deliver_webhook(state: &AppState, deposit_id: &str) -> Result<()> {
 
     let delivery = state.db.get_or_create_webhook_delivery(deposit_id).await?;
     if delivery.status == WebhookDeliveryStatus::Delivered.as_db() {
-        return Ok(());
+        return Ok(DeliveryOutcome::Delivered);
     }
 
     let network = Network::from_db(&address.network)?;
@@ -164,7 +233,7 @@ pub async fn deliver_webhook(state: &AppState, deposit_id: &str) -> Result<()> {
                     )
                     .await?;
                 info!("Webhook delivered for deposit {deposit_id}");
-                Ok(())
+                Ok(DeliveryOutcome::Delivered)
             } else {
                 let attempts = delivery.attempts + 1;
                 let final_status = if attempts >= WEBHOOK_MAX_ATTEMPTS as i32 {
@@ -183,10 +252,11 @@ pub async fn deliver_webhook(state: &AppState, deposit_id: &str) -> Result<()> {
                     )
                     .await?;
                 if attempts < WEBHOOK_MAX_ATTEMPTS as i32 {
-                    anyhow::bail!("Webhook HTTP {status}");
+                    warn!("Webhook HTTP {status} for deposit {deposit_id} (attempt {attempts})");
+                    return Ok(DeliveryOutcome::RetryAt { attempts });
                 }
                 error!("Webhook delivery failed after {attempts} attempts for deposit {deposit_id}");
-                Ok(())
+                Ok(DeliveryOutcome::Failed)
             }
         }
         Err(err) => {
@@ -207,10 +277,11 @@ pub async fn deliver_webhook(state: &AppState, deposit_id: &str) -> Result<()> {
                 )
                 .await?;
             if attempts < WEBHOOK_MAX_ATTEMPTS as i32 {
-                return Err(err.into());
+                warn!("Webhook error for deposit {deposit_id} (attempt {attempts}): {err}");
+                return Ok(DeliveryOutcome::RetryAt { attempts });
             }
             error!("Webhook delivery failed after {attempts} attempts for deposit {deposit_id}");
-            Ok(())
+            Ok(DeliveryOutcome::Failed)
         }
     }
 }
@@ -292,27 +363,77 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
 }
 
 async fn webhook_loop(state: AppState) {
+    if let Err(err) = drain_legacy_webhook_queue(&state).await {
+        warn!("legacy webhook queue drain failed: {err:#}");
+    }
+
+    let key = state.config.redis_key(WEBHOOK_ZSET_KEY);
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         interval.tick().await;
-        let key = state.config.redis_key(WEBHOOK_QUEUE_KEY);
         let mut redis = state.redis.clone();
-        let deposit_id: Option<String> = match redis.rpop(key, None).await {
+        let now = chrono::Utc::now().timestamp();
+
+        let due: Vec<String> = match redis
+            .zrangebyscore_limit(&key, "-inf", now, 0, 1)
+            .await
+        {
             Ok(v) => v,
             Err(err) => {
-                error!("webhook queue pop error: {err}");
+                error!("webhook queue read error: {err}");
                 continue;
             }
         };
-        if let Some(deposit_id) = deposit_id {
-            if let Err(err) = deliver_webhook(&state, &deposit_id).await {
-                warn!("webhook retry enqueue for {deposit_id}: {err:#}");
-                let key = state.config.redis_key(WEBHOOK_QUEUE_KEY);
-                let _: Result<(), _> = redis.lpush(key, deposit_id).await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
+        let Some(deposit_id) = due.into_iter().next() else {
+            continue;
+        };
+        if let Err(err) = redis.zrem::<_, _, ()>(&key, &deposit_id).await {
+            error!("webhook queue remove error: {err}");
+            continue;
+        }
+
+        match deliver_webhook(&state, &deposit_id).await {
+            Ok(DeliveryOutcome::RetryAt { attempts }) => {
+                if let Some(delay) = next_retry_delay_secs(attempts) {
+                    let score = now + delay as i64;
+                    if let Err(err) = redis.zadd::<_, _, _, ()>(&key, &deposit_id, score).await {
+                        error!("webhook retry schedule error for {deposit_id}: {err}");
+                    } else {
+                        info!("Webhook attempt {} for deposit {deposit_id} rescheduled in {delay}s", attempts + 1);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // Infrastructure error (DB unreachable, row missing): retry
+                // after the first backoff gap rather than spinning.
+                warn!("webhook delivery error for {deposit_id}, rescheduling: {err:#}");
+                let score = now + WEBHOOK_RETRY_DELAYS_SECS[0] as i64;
+                let _: Result<(), _> = redis.zadd(&key, &deposit_id, score).await;
             }
         }
     }
+}
+
+/// One-shot migration: move ids from the pre-backoff LIST queue into the
+/// scheduled ZSET so in-flight webhooks survive the deploy.
+async fn drain_legacy_webhook_queue(state: &AppState) -> Result<()> {
+    let list_key = state.config.redis_key(LEGACY_WEBHOOK_LIST_KEY);
+    let zset_key = state.config.redis_key(WEBHOOK_ZSET_KEY);
+    let mut redis = state.redis.clone();
+    let mut drained = 0u32;
+    loop {
+        let deposit_id: Option<String> = redis.rpop(&list_key, None).await?;
+        let Some(deposit_id) = deposit_id else { break };
+        let _: () = redis
+            .zadd(&zset_key, &deposit_id, chrono::Utc::now().timestamp())
+            .await?;
+        drained += 1;
+    }
+    if drained > 0 {
+        info!("Drained {drained} webhook id(s) from the legacy list queue");
+    }
+    Ok(())
 }
 
 async fn wallet_balance_sync_loop(state: AppState) {
@@ -541,4 +662,33 @@ struct WebhookData {
     tx_hash: String,
     confirmations: i32,
     status: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delays_follow_schedule() {
+        assert_eq!(next_retry_delay_secs(1), Some(90));
+        assert_eq!(next_retry_delay_secs(2), Some(270));
+        assert_eq!(next_retry_delay_secs(3), Some(810));
+        assert_eq!(next_retry_delay_secs(4), Some(2430));
+    }
+
+    #[test]
+    fn retries_stop_at_max_attempts() {
+        assert_eq!(next_retry_delay_secs(0), None);
+        assert_eq!(next_retry_delay_secs(-1), None);
+        assert_eq!(next_retry_delay_secs(WEBHOOK_MAX_ATTEMPTS as i32), None);
+        assert_eq!(next_retry_delay_secs(WEBHOOK_MAX_ATTEMPTS as i32 + 1), None);
+    }
+
+    #[test]
+    fn last_attempt_starts_one_hour_after_first() {
+        let total: u64 = (1..WEBHOOK_MAX_ATTEMPTS as i32)
+            .map(|attempts| next_retry_delay_secs(attempts).unwrap())
+            .sum();
+        assert_eq!(total, 3600);
+    }
 }

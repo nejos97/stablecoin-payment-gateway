@@ -164,6 +164,14 @@ impl WebhookDeliveryStatus {
         }
     }
 
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+        }
+    }
+
     pub fn from_db(value: &str) -> Result<Self, DomainError> {
         match value {
             "PENDING" => Ok(Self::Pending),
@@ -272,5 +280,22 @@ mod tests {
     fn network_roundtrip() {
         assert_eq!(Network::parse_api("tron").unwrap().as_db(), "TRON");
         assert_eq!(Network::from_db("ETHEREUM").unwrap().as_api(), "ethereum");
+    }
+
+    #[test]
+    fn webhook_status_roundtrip() {
+        assert_eq!(
+            WebhookDeliveryStatus::from_db("PENDING").unwrap().as_api(),
+            "pending"
+        );
+        assert_eq!(
+            WebhookDeliveryStatus::from_db("DELIVERED").unwrap().as_api(),
+            "delivered"
+        );
+        assert_eq!(
+            WebhookDeliveryStatus::from_db("FAILED").unwrap().as_api(),
+            "failed"
+        );
+        assert!(WebhookDeliveryStatus::from_db("delivered").is_err());
     }
 }

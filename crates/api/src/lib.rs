@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 
 use axum::extract::{Path, Query, State};
@@ -7,9 +8,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use config::AppConfig;
-use db::DepositAddressRow;
-use domain::{DepositAddressStatus, Network, Token};
-use jobs::{get_cached_wallet_balances, get_live_balances, AppState};
+use db::{DepositAddressRow, WebhookDeliveryRow};
+use domain::{DepositAddressStatus, Network, Token, WebhookDeliveryStatus};
+use jobs::{get_cached_wallet_balances, get_live_balances, retrigger_webhook, AppState, RetriggerError};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -24,6 +25,10 @@ pub fn router(state: AppState) -> Router {
             post(create_deposit_address).get(list_deposit_addresses),
         )
         .route("/deposit-addresses/{id}", get(get_deposit_address))
+        .route(
+            "/deposits/{deposit_id}/webhooks/retry",
+            post(retry_deposit_webhook),
+        )
         .route("/balances", get(get_balances))
         .route("/wallet-balances", get(get_wallet_balances));
 
@@ -181,6 +186,20 @@ async fn get_deposit_address(
         )));
     };
     let deposits = state.db.list_deposits_for_address(&id).await?;
+    let deposit_ids: Vec<String> = deposits.iter().map(|d| d.id.clone()).collect();
+    // Rows come back newest-first; keep the first one per deposit (the
+    // authoritative delivery, same convention as the jobs crate).
+    let mut deliveries: HashMap<String, WebhookDeliveryRow> = HashMap::new();
+    for delivery in state
+        .db
+        .find_webhook_deliveries_for_deposits(&deposit_ids)
+        .await?
+    {
+        deliveries
+            .entry(delivery.deposit_id.clone())
+            .or_insert(delivery);
+    }
+
     let mut base = serde_json::to_value(to_response(&row)?)?;
     if let Some(obj) = base.as_object_mut() {
         obj.insert("metadata".into(), row.metadata);
@@ -189,6 +208,10 @@ async fn get_deposit_address(
             json!(deposits
                 .into_iter()
                 .map(|d| {
+                    let webhook = deliveries
+                        .get(&d.id)
+                        .map(webhook_to_json)
+                        .unwrap_or(Value::Null);
                     json!({
                         "id": d.id,
                         "tx_hash": d.tx_hash,
@@ -197,12 +220,47 @@ async fn get_deposit_address(
                         "confirmations": d.confirmations,
                         "status": domain::DepositStatus::from_db(&d.status).map(|s| s.as_api()).unwrap_or("detected"),
                         "confirmed_at": d.confirmed_at.map(|t| t.to_rfc3339()),
+                        "webhook": webhook,
                     })
                 })
                 .collect::<Vec<_>>()),
         );
     }
     Ok(Json(base))
+}
+
+fn webhook_to_json(delivery: &WebhookDeliveryRow) -> Value {
+    json!({
+        "status": WebhookDeliveryStatus::from_db(&delivery.status).map(|s| s.as_api()).unwrap_or("pending"),
+        "attempts": delivery.attempts,
+        "last_response": delivery.last_response,
+        "last_error": delivery.last_error,
+        "updated_at": delivery.updated_at.to_rfc3339(),
+    })
+}
+
+async fn retry_deposit_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(deposit_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_secret(&headers, &state.config)?;
+    match retrigger_webhook(&state, &deposit_id).await {
+        Ok(()) => Ok(Json(json!({
+            "status": "queued",
+            "deposit_id": deposit_id,
+        }))),
+        Err(RetriggerError::DepositNotFound) => Err(ApiError::not_found(format!(
+            "Deposit not found: {deposit_id}"
+        ))),
+        Err(RetriggerError::DepositNotConfirmed) => {
+            Err(ApiError::bad_request("Deposit is not confirmed"))
+        }
+        Err(RetriggerError::WebhooksDisabled) => Err(ApiError::service_unavailable(
+            "WEBHOOK_CALLBACK_URL is not set".into(),
+        )),
+        Err(RetriggerError::Other(err)) => Err(ApiError::internal(err.to_string())),
+    }
 }
 
 async fn get_balances(
@@ -337,6 +395,12 @@ impl ApiError {
     fn internal(message: String) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        }
+    }
+    fn service_unavailable(message: String) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message,
         }
     }
