@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::Result;
 use chain::ChainClients;
 use config::{
-    AppConfig, ADDRESS_REQUEST_DELAY_MS, WALLET_BALANCE_SYNC_INTERVAL_SECS, WEBHOOK_MAX_ATTEMPTS,
-    WEBHOOK_RETRY_DELAYS_SECS,
+    AppConfig, ADDRESS_REQUEST_DELAY_MS, API_KEY_EXPIRY_SWEEP_INTERVAL_SECS,
+    WALLET_BALANCE_SYNC_INTERVAL_SECS, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_RETRY_DELAYS_SECS,
 };
 use db::Db;
 use domain::{
@@ -99,23 +99,44 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
         )
         .await?;
 
-    if is_confirmed && state.config.webhook_callback_url.is_some() {
-        if !state.db.has_delivered_webhook(&deposit.id).await? {
-            enqueue_webhook(state, &deposit.id).await?;
+    // Fan out to every active endpoint; no endpoints configured is a no-op.
+    if is_confirmed {
+        for endpoint in state.db.active_webhook_endpoints().await? {
+            if !state.db.has_delivered_webhook(&deposit.id, &endpoint.id).await? {
+                enqueue_webhook(state, &deposit.id, &endpoint.id).await?;
+            }
         }
     }
 
     Ok(())
 }
 
+/// ZSET member for a scheduled delivery. Both ids are UUIDs (`[0-9a-f-]`),
+/// so `|` can never appear inside them.
+pub fn encode_queue_member(deposit_id: &str, endpoint_id: &str) -> String {
+    format!("{deposit_id}|{endpoint_id}")
+}
+
+/// `None` for legacy members written before per-endpoint deliveries (a bare
+/// deposit id) — the webhook loop fans those out to all active endpoints.
+pub fn decode_queue_member(member: &str) -> Option<(&str, &str)> {
+    member
+        .split_once('|')
+        .filter(|(deposit, endpoint)| !deposit.is_empty() && !endpoint.is_empty())
+}
+
 /// Schedule a delivery attempt for "now". ZSET members are unique, so
-/// re-enqueueing a deposit that already has a scheduled retry simply moves it
+/// re-enqueueing a pair that already has a scheduled retry simply moves it
 /// forward instead of adding a duplicate.
-pub async fn enqueue_webhook(state: &AppState, deposit_id: &str) -> Result<()> {
+pub async fn enqueue_webhook(state: &AppState, deposit_id: &str, endpoint_id: &str) -> Result<()> {
     let key = state.config.redis_key(WEBHOOK_ZSET_KEY);
     let mut redis = state.redis.clone();
     let _: () = redis
-        .zadd(key, deposit_id, chrono::Utc::now().timestamp())
+        .zadd(
+            key,
+            encode_queue_member(deposit_id, endpoint_id),
+            chrono::Utc::now().timestamp(),
+        )
         .await?;
     Ok(())
 }
@@ -137,7 +158,7 @@ pub enum DeliveryOutcome {
     RetryAt { attempts: i32 },
     /// Attempt failed and the budget is exhausted; automatic retries stop.
     Failed,
-    /// Nothing sent (WEBHOOK_CALLBACK_URL unset).
+    /// Nothing sent (target endpoint inactive or deleted).
     Skipped,
 }
 
@@ -145,7 +166,7 @@ pub enum DeliveryOutcome {
 pub enum RetriggerError {
     DepositNotFound,
     DepositNotConfirmed,
-    WebhooksDisabled,
+    NoActiveEndpoints,
     Other(anyhow::Error),
 }
 
@@ -155,33 +176,85 @@ impl From<anyhow::Error> for RetriggerError {
     }
 }
 
-/// Manual replay for the dashboard: reset the delivery row to PENDING / 0
-/// attempts, then schedule an immediate attempt. Never touches `deposits` or
-/// `deposit_addresses`.
+/// Manual replay for the dashboard: for every active endpoint, reset the
+/// delivery row to PENDING / 0 attempts, then schedule an immediate attempt.
+/// Never touches `deposits` or `deposit_addresses`.
 pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(), RetriggerError> {
     let deposit = state
         .db
         .find_deposit(deposit_id)
         .await?
         .ok_or(RetriggerError::DepositNotFound)?;
-    if state.config.webhook_callback_url.is_none() {
-        return Err(RetriggerError::WebhooksDisabled);
+    let endpoints = state.db.active_webhook_endpoints().await?;
+    if endpoints.is_empty() {
+        return Err(RetriggerError::NoActiveEndpoints);
     }
     if deposit.status != DepositStatus::Confirmed.as_db() {
         return Err(RetriggerError::DepositNotConfirmed);
     }
 
-    state.db.reset_webhook_delivery(&deposit.id).await?;
-    enqueue_webhook(state, &deposit.id).await?;
-    info!("Webhook retriggered for deposit {deposit_id}");
+    for endpoint in &endpoints {
+        state.db.reset_webhook_delivery(&deposit.id, &endpoint.id).await?;
+        enqueue_webhook(state, &deposit.id, &endpoint.id).await?;
+    }
+    info!(
+        "Webhook retriggered for deposit {deposit_id} towards {} endpoint(s)",
+        endpoints.len()
+    );
     Ok(())
 }
 
-pub async fn deliver_webhook(state: &AppState, deposit_id: &str) -> Result<DeliveryOutcome> {
-    let Some(webhook_url) = &state.config.webhook_callback_url else {
-        warn!("Webhook delivery skipped — WEBHOOK_CALLBACK_URL is not set");
-        return Ok(DeliveryOutcome::Skipped);
+/// Bulk manual replay: re-queue every (deposit, endpoint) pair whose
+/// authoritative delivery is FAILED; legacy rows (no endpoint) fan out to all
+/// active endpoints. Individual failures are logged and skipped; returns the
+/// number of pairs successfully re-queued.
+pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, RetriggerError> {
+    let endpoints = state.db.active_webhook_endpoints().await?;
+    if endpoints.is_empty() {
+        return Err(RetriggerError::NoActiveEndpoints);
+    }
+
+    let targets = state.db.failed_webhook_targets().await?;
+    let mut retried = 0usize;
+    for (deposit_id, endpoint_id) in &targets {
+        let target_endpoints: Vec<&str> = match endpoint_id {
+            Some(id) => vec![id.as_str()],
+            // Legacy failure — replay towards every active endpoint.
+            None => endpoints.iter().map(|e| e.id.as_str()).collect(),
+        };
+        for endpoint_id in target_endpoints {
+            let result: Result<()> = async {
+                state.db.reset_webhook_delivery(deposit_id, endpoint_id).await?;
+                enqueue_webhook(state, deposit_id, endpoint_id).await
+            }
+            .await;
+            match result {
+                Ok(()) => retried += 1,
+                Err(err) => {
+                    warn!("Bulk webhook retry skipped deposit {deposit_id} endpoint {endpoint_id}: {err:#}")
+                }
+            }
+        }
+    }
+    info!("Bulk webhook retry: {retried} delivery target(s) re-queued");
+    Ok(retried)
+}
+
+pub async fn deliver_webhook(
+    state: &AppState,
+    deposit_id: &str,
+    endpoint_id: &str,
+) -> Result<DeliveryOutcome> {
+    // Reload the endpoint on every attempt so a deactivation takes effect
+    // immediately: the queued member is consumed without being rescheduled.
+    let endpoint = match state.db.find_webhook_endpoint(endpoint_id).await? {
+        Some(endpoint) if endpoint.is_active => endpoint,
+        _ => {
+            warn!("Webhook delivery skipped for deposit {deposit_id} — endpoint {endpoint_id} is inactive or gone");
+            return Ok(DeliveryOutcome::Skipped);
+        }
     };
+    let webhook_url = &endpoint.url;
 
     let Some(deposit) = state.db.find_deposit(deposit_id).await? else {
         anyhow::bail!("Deposit not found: {deposit_id}");
@@ -190,7 +263,10 @@ pub async fn deliver_webhook(state: &AppState, deposit_id: &str) -> Result<Deliv
         anyhow::bail!("Deposit address not found for deposit {deposit_id}");
     };
 
-    let delivery = state.db.get_or_create_webhook_delivery(deposit_id).await?;
+    let delivery = state
+        .db
+        .get_or_create_webhook_delivery(deposit_id, endpoint_id)
+        .await?;
     if delivery.status == WebhookDeliveryStatus::Delivered.as_db() {
         return Ok(DeliveryOutcome::Delivered);
     }
@@ -298,6 +374,24 @@ pub fn spawn_workers(state: AppState) {
     tokio::spawn(async move { webhook_loop(s4).await });
     let s5 = state.clone();
     tokio::spawn(async move { wallet_balance_sync_loop(s5).await });
+    let s6 = state.clone();
+    tokio::spawn(async move { api_key_expiry_loop(s6).await });
+}
+
+/// Materialize EXPIRED statuses for past-deadline API keys. Runs once right
+/// at boot, then every `API_KEY_EXPIRY_SWEEP_INTERVAL_SECS`. Expired keys are
+/// already rejected at lookup time — this keeps listings and stats honest.
+async fn api_key_expiry_loop(state: AppState) {
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(API_KEY_EXPIRY_SWEEP_INTERVAL_SECS));
+    loop {
+        interval.tick().await;
+        match state.db.expire_stale_api_keys().await {
+            Ok(0) => {}
+            Ok(expired) => info!("Expired {expired} api key(s)"),
+            Err(err) => error!("api key expiry sweep error: {err:#}"),
+        }
+    }
 }
 
 async fn monitor_loop(state: AppState, network: Network, poll_secs: u64) {
@@ -384,22 +478,46 @@ async fn webhook_loop(state: AppState) {
                 continue;
             }
         };
-        let Some(deposit_id) = due.into_iter().next() else {
+        let Some(member) = due.into_iter().next() else {
             continue;
         };
-        if let Err(err) = redis.zrem::<_, _, ()>(&key, &deposit_id).await {
+        if let Err(err) = redis.zrem::<_, _, ()>(&key, &member).await {
             error!("webhook queue remove error: {err}");
             continue;
         }
 
-        match deliver_webhook(&state, &deposit_id).await {
+        let Some((deposit_id, endpoint_id)) = decode_queue_member(&member) else {
+            // Legacy member (bare deposit id, pre-multi-endpoint deploy):
+            // fan it out to the current active endpoints.
+            match state.db.active_webhook_endpoints().await {
+                Ok(endpoints) if endpoints.is_empty() => {
+                    warn!("Dropping legacy webhook queue member {member} — no active endpoints");
+                }
+                Ok(endpoints) => {
+                    info!("Fanning out legacy webhook queue member {member} to {} endpoint(s)", endpoints.len());
+                    for endpoint in endpoints {
+                        if let Err(err) = enqueue_webhook(&state, &member, &endpoint.id).await {
+                            error!("legacy member fan-out error for {member}: {err:#}");
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!("legacy member fan-out read error for {member}, rescheduling: {err:#}");
+                    let score = now + WEBHOOK_RETRY_DELAYS_SECS[0] as i64;
+                    let _: Result<(), _> = redis.zadd(&key, &member, score).await;
+                }
+            }
+            continue;
+        };
+
+        match deliver_webhook(&state, deposit_id, endpoint_id).await {
             Ok(DeliveryOutcome::RetryAt { attempts }) => {
                 if let Some(delay) = next_retry_delay_secs(attempts) {
                     let score = now + delay as i64;
-                    if let Err(err) = redis.zadd::<_, _, _, ()>(&key, &deposit_id, score).await {
-                        error!("webhook retry schedule error for {deposit_id}: {err}");
+                    if let Err(err) = redis.zadd::<_, _, _, ()>(&key, &member, score).await {
+                        error!("webhook retry schedule error for {member}: {err}");
                     } else {
-                        info!("Webhook attempt {} for deposit {deposit_id} rescheduled in {delay}s", attempts + 1);
+                        info!("Webhook attempt {} for deposit {deposit_id} (endpoint {endpoint_id}) rescheduled in {delay}s", attempts + 1);
                     }
                 }
             }
@@ -407,9 +525,9 @@ async fn webhook_loop(state: AppState) {
             Err(err) => {
                 // Infrastructure error (DB unreachable, row missing): retry
                 // after the first backoff gap rather than spinning.
-                warn!("webhook delivery error for {deposit_id}, rescheduling: {err:#}");
+                warn!("webhook delivery error for {member}, rescheduling: {err:#}");
                 let score = now + WEBHOOK_RETRY_DELAYS_SECS[0] as i64;
-                let _: Result<(), _> = redis.zadd(&key, &deposit_id, score).await;
+                let _: Result<(), _> = redis.zadd(&key, &member, score).await;
             }
         }
     }
@@ -667,6 +785,22 @@ struct WebhookData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_member_roundtrip() {
+        let member = encode_queue_member("dep-123", "ep-456");
+        assert_eq!(member, "dep-123|ep-456");
+        assert_eq!(decode_queue_member(&member), Some(("dep-123", "ep-456")));
+    }
+
+    #[test]
+    fn legacy_queue_member_is_detected() {
+        assert_eq!(decode_queue_member("a1b2c3-uuid-without-separator"), None);
+        assert_eq!(decode_queue_member(""), None);
+        assert_eq!(decode_queue_member("|"), None);
+        assert_eq!(decode_queue_member("dep|"), None);
+        assert_eq!(decode_queue_member("|ep"), None);
+    }
 
     #[test]
     fn retry_delays_follow_schedule() {

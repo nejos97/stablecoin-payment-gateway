@@ -51,6 +51,18 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  dashboard:
+    build:
+      context: apps/dashboard
+      dockerfile: Dockerfile
+    container_name: stablecoin-payment-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8080}:80"
+    depends_on:
+      - api
+
 volumes:
   postgres_data:
   redis_data:

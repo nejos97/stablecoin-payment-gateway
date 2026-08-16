@@ -24,9 +24,6 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
-    if config.webhook_callback_url.is_none() {
-        tracing::warn!("WEBHOOK_CALLBACK_URL is not set — webhooks disabled");
-    }
     if config.trongrid_api_key.is_none() {
         tracing::warn!("TRONGRID_API_KEY is not set — Tron monitoring disabled");
     }
@@ -44,6 +41,14 @@ async fn main() -> anyhow::Result<()> {
     let db = Db::connect(&config.database_url).await?;
     if let Err(err) = db.migrate().await {
         tracing::warn!("sqlx migrate skipped or failed (schema may already exist): {err:#}");
+    }
+
+    match db.active_webhook_endpoints().await {
+        Ok(endpoints) if endpoints.is_empty() => tracing::warn!(
+            "No active webhook endpoints configured — outgoing webhooks are disabled until one is added in the dashboard (Settings)"
+        ),
+        Ok(endpoints) => info!("{} active webhook endpoint(s) configured", endpoints.len()),
+        Err(err) => tracing::warn!("Could not read webhook endpoints: {err:#}"),
     }
 
     let redis_client = redis::Client::open(config.redis_url.as_str())

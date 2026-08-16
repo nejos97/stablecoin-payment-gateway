@@ -14,6 +14,15 @@ pub const WEBHOOK_RETRY_DELAYS_SECS: [u64; 4] = [90, 270, 810, 2430];
 const _: () = assert!(WEBHOOK_RETRY_DELAYS_SECS.len() == WEBHOOK_MAX_ATTEMPTS as usize - 1);
 pub const WALLET_BALANCE_SYNC_INTERVAL_SECS: u64 = 60 * 60;
 pub const ADDRESS_REQUEST_DELAY_MS: u64 = 300;
+/// Default payment-address expiry when the DB setting is absent; the value
+/// itself lives in `app_settings` and is managed from the dashboard.
+pub const DEPOSIT_EXPIRY_DEFAULT_MINUTES: i64 = 60;
+pub const DEPOSIT_EXPIRY_MAX_MINUTES: i64 = 1440;
+/// Allowed API-key lifetimes (1/3/6 months, 1 year); no expiry when omitted.
+pub const API_KEY_EXPIRY_ALLOWED_DAYS: [i64; 4] = [30, 90, 180, 365];
+/// Expired keys are rejected at lookup time immediately; this sweep only
+/// materializes the EXPIRED status for listings and stats.
+pub const API_KEY_EXPIRY_SWEEP_INTERVAL_SECS: u64 = 300;
 
 pub const USDT_ETH: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 pub const USDT_TRON: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
@@ -28,8 +37,6 @@ pub struct AppConfig {
     pub database_url: String,
     pub redis_url: String,
     pub redis_prefix: String,
-    pub webhook_callback_url: Option<String>,
-    pub deposit_expiry_minutes: u64,
     pub polling_interval_seconds: u64,
     pub eth_confirmations: i32,
     pub tron_confirmations: i32,
@@ -41,6 +48,10 @@ pub struct AppConfig {
     pub eth_rpc_base_url: String,
     pub helius_rpc_base_url: String,
     pub helius_api_base_url: String,
+    pub jwt_secret: Option<String>,
+    pub access_token_ttl_minutes: i64,
+    pub refresh_token_ttl_days: i64,
+    pub cors_allowed_origins: Option<String>,
 }
 
 impl AppConfig {
@@ -63,8 +74,6 @@ impl AppConfig {
             wallet_mnemonic,
             database_url,
             redis_url,
-            webhook_callback_url: optional("WEBHOOK_CALLBACK_URL"),
-            deposit_expiry_minutes: parse_or("DEPOSIT_EXPIRY_MINUTES", 30),
             polling_interval_seconds: parse_or("POLLING_INTERVAL_SECONDS", 10),
             eth_confirmations: parse_or("ETH_CONFIRMATIONS", 12),
             tron_confirmations: parse_or("TRON_CONFIRMATIONS", 19),
@@ -88,6 +97,10 @@ impl AppConfig {
                 "HELIUS_API_BASE_URL",
                 "https://api.helius.xyz",
             ),
+            jwt_secret: optional("JWT_SECRET").filter(|s| s.len() >= 32),
+            access_token_ttl_minutes: parse_or("ACCESS_TOKEN_TTL_MINUTES", 15),
+            refresh_token_ttl_days: parse_or("REFRESH_TOKEN_TTL_DAYS", 30),
+            cors_allowed_origins: optional("CORS_ALLOWED_ORIGINS"),
         })
     }
 

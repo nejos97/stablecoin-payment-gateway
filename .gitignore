@@ -22,3 +22,7 @@ Thumbs.db
 # Logs & local tooling
 *.log
 /coverage/
+
+# Dashboard (Node)
+apps/dashboard/node_modules/
+apps/dashboard/dist/

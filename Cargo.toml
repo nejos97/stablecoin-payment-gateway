@@ -4,6 +4,7 @@ members = [
     "crates/config",
     "crates/domain",
     "crates/wallet",
+    "crates/auth",
     "crates/db",
     "crates/chain",
     "crates/jobs",
@@ -19,8 +20,12 @@ authors = ["Jonathan Nenba"]
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+jsonwebtoken = "9"
+rand = "0.8"
+subtle = "2"
 base58 = "0.2"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
@@ -55,6 +60,7 @@ spl-token = { version = "7", features = ["no-entrypoint"] }
 config = { path = "crates/config" }
 domain = { path = "crates/domain" }
 wallet = { path = "crates/wallet" }
+auth = { path = "crates/auth" }
 db = { path = "crates/db" }
 chain = { path = "crates/chain" }
 jobs = { path = "crates/jobs" }

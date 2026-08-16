@@ -172,12 +172,102 @@ impl WebhookDeliveryStatus {
         }
     }
 
+    pub fn parse_api(value: &str) -> Result<Self, DomainError> {
+        match value.to_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "delivered" => Ok(Self::Delivered),
+            "failed" => Ok(Self::Failed),
+            _ => Err(DomainError::InvalidStatus(value.to_string())),
+        }
+    }
+
     pub fn from_db(value: &str) -> Result<Self, DomainError> {
         match value {
             "PENDING" => Ok(Self::Pending),
             "DELIVERED" => Ok(Self::Delivered),
             "FAILED" => Ok(Self::Failed),
             _ => Err(DomainError::InvalidStatus(value.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApiKeyStatus {
+    Active,
+    Revoked,
+    Expired,
+}
+
+impl ApiKeyStatus {
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Revoked => "REVOKED",
+            Self::Expired => "EXPIRED",
+        }
+    }
+
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse_api(value: &str) -> Result<Self, DomainError> {
+        match value.to_lowercase().as_str() {
+            "active" => Ok(Self::Active),
+            "revoked" => Ok(Self::Revoked),
+            "expired" => Ok(Self::Expired),
+            _ => Err(DomainError::InvalidStatus(value.to_string())),
+        }
+    }
+
+    pub fn from_db(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "ACTIVE" => Ok(Self::Active),
+            "REVOKED" => Ok(Self::Revoked),
+            "EXPIRED" => Ok(Self::Expired),
+            _ => Err(DomainError::InvalidStatus(value.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StaffRole {
+    Admin,
+    Operator,
+}
+
+impl StaffRole {
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            Self::Admin => "ADMIN",
+            Self::Operator => "OPERATOR",
+        }
+    }
+
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Operator => "operator",
+        }
+    }
+
+    pub fn parse_api(value: &str) -> Result<Self, DomainError> {
+        match value.to_lowercase().as_str() {
+            "admin" => Ok(Self::Admin),
+            "operator" => Ok(Self::Operator),
+            _ => Err(DomainError::InvalidRole(value.to_string())),
+        }
+    }
+
+    pub fn from_db(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "ADMIN" => Ok(Self::Admin),
+            "OPERATOR" => Ok(Self::Operator),
+            _ => Err(DomainError::InvalidRole(value.to_string())),
         }
     }
 }
@@ -200,6 +290,8 @@ pub enum DomainError {
     InvalidStatus(String),
     #[error("Invalid amount: {0}")]
     InvalidAmount(String),
+    #[error("Invalid role: {0}")]
+    InvalidRole(String),
 }
 
 pub fn raw_to_decimal(raw: &str) -> Result<Decimal, DomainError> {
@@ -280,6 +372,26 @@ mod tests {
     fn network_roundtrip() {
         assert_eq!(Network::parse_api("tron").unwrap().as_db(), "TRON");
         assert_eq!(Network::from_db("ETHEREUM").unwrap().as_api(), "ethereum");
+    }
+
+    #[test]
+    fn api_key_status_roundtrip() {
+        assert_eq!(ApiKeyStatus::from_db("ACTIVE").unwrap().as_api(), "active");
+        assert_eq!(ApiKeyStatus::from_db("REVOKED").unwrap().as_api(), "revoked");
+        assert_eq!(ApiKeyStatus::from_db("EXPIRED").unwrap().as_api(), "expired");
+        assert_eq!(ApiKeyStatus::parse_api("Expired").unwrap().as_db(), "EXPIRED");
+        assert!(ApiKeyStatus::from_db("expired").is_err());
+        assert!(ApiKeyStatus::parse_api("disabled").is_err());
+    }
+
+    #[test]
+    fn staff_role_roundtrip() {
+        assert_eq!(StaffRole::parse_api("admin").unwrap().as_db(), "ADMIN");
+        assert_eq!(StaffRole::parse_api("Operator").unwrap().as_db(), "OPERATOR");
+        assert_eq!(StaffRole::from_db("ADMIN").unwrap().as_api(), "admin");
+        assert_eq!(StaffRole::from_db("OPERATOR").unwrap().as_api(), "operator");
+        assert!(StaffRole::from_db("admin").is_err());
+        assert!(StaffRole::parse_api("viewer").is_err());
     }
 
     #[test]

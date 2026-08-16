@@ -11,9 +11,14 @@ use db::{DepositAddressRow, WebhookDeliveryRow};
 use domain::{DepositAddressStatus, Network, Token, WebhookDeliveryStatus};
 use jobs::{get_cached_wallet_balances, get_live_balances, retrigger_webhook, AppState, RetriggerError};
 use rust_decimal::Decimal;
+use axum::http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+
+mod admin;
+mod middleware;
 
 const READINESS_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
@@ -29,14 +34,44 @@ pub fn router(state: AppState) -> Router {
             post(retry_deposit_webhook),
         )
         .route("/balances", get(get_balances))
-        .route("/wallet-balances", get(get_wallet_balances));
+        .route("/wallet-balances", get(get_wallet_balances))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::require_api_key,
+        ));
 
-    Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .nest("/api/v1", api_v1)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .nest("/api/v1", api_v1);
+
+    if state.config.jwt_secret.is_some() {
+        app = app.nest("/api/admin/v1", admin::admin_router(&state));
+    } else {
+        tracing::warn!(
+            "JWT_SECRET is not set (min 32 chars) — /api/admin/v1 and the dashboard are disabled"
+        );
+    }
+
+    let app = app.layer(TraceLayer::new_for_http());
+    let app = match state.config.cors_allowed_origins.as_deref() {
+        Some(origins) => app.layer(cors_layer(origins)),
+        None => app,
+    };
+    app.with_state(state)
+}
+
+/// Optional safety net for setups where the dashboard is not served behind
+/// the same origin (dev proxy / nginx cover the normal cases).
+fn cors_layer(origins: &str) -> CorsLayer {
+    let list: Vec<HeaderValue> = origins
+        .split(',')
+        .filter_map(|origin| origin.trim().parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(list))
+        .allow_methods(Any)
+        .allow_headers(Any)
 }
 
 async fn healthz() -> Json<Value> {
@@ -103,7 +138,8 @@ async fn create_deposit_address(
             .map(|d| d.with_timezone(&Utc))
             .map_err(|_| ApiError::bad_request("Invalid expires_at"))?
     } else {
-        Utc::now() + Duration::minutes(state.config.deposit_expiry_minutes as i64)
+        let expiry_minutes = state.db.deposit_expiry_minutes().await?;
+        Utc::now() + Duration::minutes(expiry_minutes)
     };
 
     let derivation_index = state.db.next_derivation_index(network).await?;
@@ -179,18 +215,25 @@ async fn get_deposit_address(
     };
     let deposits = state.db.list_deposits_for_address(&id).await?;
     let deposit_ids: Vec<String> = deposits.iter().map(|d| d.id.clone()).collect();
-    // Rows come back newest-first; keep the first one per deposit (the
-    // authoritative delivery, same convention as the jobs crate).
-    let mut deliveries: HashMap<String, WebhookDeliveryRow> = HashMap::new();
+    // Rows come back newest-first; keep the first one per (deposit, endpoint)
+    // pair (the authoritative delivery, same convention as the jobs crate).
+    let mut deliveries: HashMap<(String, Option<String>), WebhookDeliveryRow> = HashMap::new();
     for delivery in state
         .db
         .find_webhook_deliveries_for_deposits(&deposit_ids)
         .await?
     {
         deliveries
-            .entry(delivery.deposit_id.clone())
+            .entry((delivery.deposit_id.clone(), delivery.webhook_endpoint_id.clone()))
             .or_insert(delivery);
     }
+    let endpoint_urls: HashMap<String, String> = state
+        .db
+        .list_webhook_endpoints()
+        .await?
+        .into_iter()
+        .map(|e| (e.id, e.url))
+        .collect();
 
     let mut base = serde_json::to_value(to_response(&row)?)?;
     if let Some(obj) = base.as_object_mut() {
@@ -200,10 +243,35 @@ async fn get_deposit_address(
             json!(deposits
                 .into_iter()
                 .map(|d| {
-                    let webhook = deliveries
-                        .get(&d.id)
-                        .map(webhook_to_json)
+                    let mut entries: Vec<&WebhookDeliveryRow> = deliveries
+                        .iter()
+                        .filter(|((deposit_id, _), _)| deposit_id == &d.id)
+                        .map(|(_, delivery)| delivery)
+                        .collect();
+                    entries.sort_by_key(|delivery| std::cmp::Reverse(delivery.updated_at));
+
+                    // `webhook` keeps the pre-multi-endpoint shape (most
+                    // recently updated delivery, legacy rows included).
+                    let webhook = entries
+                        .first()
+                        .map(|delivery| webhook_to_json(delivery))
                         .unwrap_or(Value::Null);
+                    let webhooks: Vec<Value> = entries
+                        .iter()
+                        .filter_map(|delivery| {
+                            let endpoint_id = delivery.webhook_endpoint_id.as_ref()?;
+                            let mut entry = webhook_to_json(delivery);
+                            if let Some(entry_obj) = entry.as_object_mut() {
+                                entry_obj.insert("endpoint_id".into(), json!(endpoint_id));
+                                entry_obj.insert(
+                                    "endpoint_url".into(),
+                                    json!(endpoint_urls.get(endpoint_id)),
+                                );
+                            }
+                            Some(entry)
+                        })
+                        .collect();
+
                     json!({
                         "id": d.id,
                         "tx_hash": d.tx_hash,
@@ -213,6 +281,7 @@ async fn get_deposit_address(
                         "status": domain::DepositStatus::from_db(&d.status).map(|s| s.as_api()).unwrap_or("detected"),
                         "confirmed_at": d.confirmed_at.map(|t| t.to_rfc3339()),
                         "webhook": webhook,
+                        "webhooks": webhooks,
                     })
                 })
                 .collect::<Vec<_>>()),
@@ -246,8 +315,8 @@ async fn retry_deposit_webhook(
         Err(RetriggerError::DepositNotConfirmed) => {
             Err(ApiError::bad_request("Deposit is not confirmed"))
         }
-        Err(RetriggerError::WebhooksDisabled) => Err(ApiError::service_unavailable(
-            "WEBHOOK_CALLBACK_URL is not set".into(),
+        Err(RetriggerError::NoActiveEndpoints) => Err(ApiError::service_unavailable(
+            "No active webhook endpoints configured".into(),
         )),
         Err(RetriggerError::Other(err)) => Err(ApiError::internal(err.to_string())),
     }
@@ -334,6 +403,24 @@ impl ApiError {
             message: message.into(),
         }
     }
+    fn unauthorized(message: &str) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+    fn forbidden(message: &str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+    fn conflict(message: &str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
     fn internal(message: String) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -362,6 +449,12 @@ impl From<anyhow::Error> for ApiError {
 
 impl From<serde_json::Error> for ApiError {
     fn from(value: serde_json::Error) -> Self {
+        Self::internal(value.to_string())
+    }
+}
+
+impl From<redis::RedisError> for ApiError {
+    fn from(value: redis::RedisError) -> Self {
         Self::internal(value.to_string())
     }
 }
