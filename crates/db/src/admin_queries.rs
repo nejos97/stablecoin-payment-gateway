@@ -30,6 +30,9 @@ pub struct WebhookDeliveryDetailRow {
     pub last_response: Option<i32>,
     #[sqlx(rename = "lastError")]
     pub last_error: Option<String>,
+    /// Body of the most recent attempt; NULL until one is made.
+    #[sqlx(rename = "lastPayload")]
+    pub last_payload: Option<serde_json::Value>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
@@ -51,7 +54,7 @@ const WEBHOOK_DETAIL_INNER: &str = r#"
     SELECT DISTINCT ON (w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId")
         w.id, w."eventType", w."depositId", w."webhookEndpointId", e.url AS "endpointUrl",
         w.status::text AS status, w.attempts,
-        w."lastResponse", w."lastError",
+        w."lastResponse", w."lastError", w."lastPayload",
         w."createdAt" AT TIME ZONE 'UTC' AS "createdAt",
         w."updatedAt" AT TIME ZONE 'UTC' AS "updatedAt",
         d."txHash", d.amount, d.status::text AS "depositStatus",

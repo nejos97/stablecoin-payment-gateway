@@ -1,9 +1,6 @@
-import { useEffect, useState } from "react"
-import { KeyRound } from "lucide-react"
 import { toast } from "sonner"
 
 import { QueryError } from "@/components/shared/QueryError"
-import { Button } from "@/components/ui/button"
 import {
   Card,
   CardContent,
@@ -11,7 +8,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
@@ -38,82 +34,11 @@ export function SettingsPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">
-          System configuration — payment expiry and API key prefix.
+          System configuration — payment expiry.
         </p>
       </div>
       <PaymentExpiryCard />
-      <ApiKeyPrefixCard />
     </div>
-  )
-}
-
-function ApiKeyPrefixCard() {
-  const settings = useSettings()
-  const updateSettings = useUpdateSettings()
-  const [prefix, setPrefix] = useState("")
-
-  useEffect(() => {
-    if (settings.data) setPrefix(settings.data.api_key_prefix ?? "")
-  }, [settings.data])
-
-  const saved = settings.data?.api_key_prefix ?? ""
-  const dirty = prefix !== saved
-  const preview = `${prefix ? `${prefix}_` : ""}xxxxxxxx_${"·".repeat(24)}`
-
-  async function save() {
-    try {
-      await updateSettings.mutateAsync({ api_key_prefix: prefix })
-      toast.success(
-        prefix
-          ? `New API keys will start with “${prefix}_”`
-          : "API key prefix removed — new keys have no tag",
-      )
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Update failed")
-    }
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>API key prefix</CardTitle>
-        <CardDescription>
-          Optional tag prepended to newly generated API keys (max 5 alphanumeric
-          characters). Existing keys keep working unchanged.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        {settings.isError ? (
-          <QueryError error={settings.error} />
-        ) : settings.isLoading ? (
-          <Skeleton className="h-9 w-64" />
-        ) : (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <Input
-                className="w-32"
-                maxLength={5}
-                placeholder="none"
-                value={prefix}
-                onChange={(event) =>
-                  setPrefix(event.target.value.replace(/[^a-zA-Z0-9]/g, ""))
-                }
-                aria-label="API key prefix"
-              />
-              <Button onClick={save} disabled={!dirty || updateSettings.isPending} size="sm">
-                {updateSettings.isPending ? "Saving…" : "Save"}
-              </Button>
-            </div>
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <KeyRound className="size-3.5 shrink-0" />
-              <span>
-                New keys will look like <code className="text-xs">{preview}</code>
-              </span>
-            </div>
-          </div>
-        )}
-      </CardContent>
-    </Card>
   )
 }
 

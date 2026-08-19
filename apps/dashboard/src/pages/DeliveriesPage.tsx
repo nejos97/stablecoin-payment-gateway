@@ -1,7 +1,10 @@
-import { RefreshCw, RotateCcw } from "lucide-react"
+import { useState } from "react"
+import { Braces, RefreshCw, RotateCcw } from "lucide-react"
 import { Link, useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 
+import { CopyButton } from "@/components/shared/CopyButton"
+import { JsonViewer } from "@/components/shared/JsonViewer"
 import { Pagination } from "@/components/shared/Pagination"
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
@@ -18,6 +21,13 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import {
   Select,
   SelectContent,
@@ -59,6 +69,7 @@ export function DeliveriesPage() {
   const retryOne = useRetryWebhook()
   const retryDelivery = useRetryWebhookDelivery()
   const retryAll = useRetryAllFailedWebhooks()
+  const [payloadWebhook, setPayloadWebhook] = useState<WebhookDelivery | null>(null)
 
   function updateParams(updates: Record<string, string | undefined>) {
     const next = new URLSearchParams(searchParams)
@@ -235,18 +246,29 @@ export function DeliveriesPage() {
                       {formatDate(webhook.updated_at)}
                     </TableCell>
                     <TableCell className="text-right">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={
-                          !canRetry(webhook) ||
-                          retryOne.isPending ||
-                          retryDelivery.isPending
-                        }
-                        onClick={() => handleRetry(webhook)}
-                      >
-                        <RefreshCw className="size-3.5" /> Retry
-                      </Button>
+                      <div className="flex justify-end gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={webhook.payload === null}
+                          title={webhook.payload === null ? "No delivery attempt yet" : undefined}
+                          onClick={() => setPayloadWebhook(webhook)}
+                        >
+                          <Braces className="size-3.5" /> Payload
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={
+                            !canRetry(webhook) ||
+                            retryOne.isPending ||
+                            retryDelivery.isPending
+                          }
+                          onClick={() => handleRetry(webhook)}
+                        >
+                          <RefreshCw className="size-3.5" /> Retry
+                        </Button>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -263,6 +285,36 @@ export function DeliveriesPage() {
           )}
         </>
       )}
+
+      <Dialog
+        open={payloadWebhook !== null}
+        onOpenChange={(open) => {
+          if (!open) setPayloadWebhook(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Webhook payload</DialogTitle>
+            <DialogDescription>
+              JSON body sent on the most recent delivery attempt
+              {payloadWebhook?.endpoint_url ? ` to ${payloadWebhook.endpoint_url}` : ""}.
+            </DialogDescription>
+          </DialogHeader>
+          {payloadWebhook?.payload && (
+            <>
+              <div className="max-h-[60vh] overflow-auto">
+                <JsonViewer value={payloadWebhook.payload} />
+              </div>
+              <div className="flex justify-end">
+                <CopyButton
+                  value={JSON.stringify(payloadWebhook.payload, null, 2)}
+                  label="Copy JSON"
+                />
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

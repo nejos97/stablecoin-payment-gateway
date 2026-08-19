@@ -477,6 +477,7 @@ pub async fn deliver_webhook(
                         delivery.attempts + 1,
                         Some(status),
                         None,
+                        Some(payload.clone()),
                     )
                     .await?;
                 info!("Webhook delivered for {subject_label}");
@@ -496,6 +497,7 @@ pub async fn deliver_webhook(
                         attempts,
                         Some(status),
                         Some(format!("HTTP {status}")),
+                        Some(payload.clone()),
                     )
                     .await?;
                 if attempts < WEBHOOK_MAX_ATTEMPTS as i32 {
@@ -521,6 +523,7 @@ pub async fn deliver_webhook(
                     attempts,
                     None,
                     Some(err.to_string()),
+                    Some(payload.clone()),
                 )
                 .await?;
             if attempts < WEBHOOK_MAX_ATTEMPTS as i32 {

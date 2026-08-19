@@ -609,6 +609,7 @@ impl Db {
         attempts: i32,
         last_response: Option<i32>,
         last_error: Option<String>,
+        last_payload: Option<serde_json::Value>,
     ) -> Result<()> {
         sqlx::query(
             r#"
@@ -617,6 +618,7 @@ impl Db {
                 attempts = $3,
                 "lastResponse" = $4,
                 "lastError" = $5,
+                "lastPayload" = COALESCE($6, "lastPayload"),
                 "updatedAt" = NOW()
             WHERE id = $1
             "#,
@@ -626,6 +628,7 @@ impl Db {
         .bind(attempts)
         .bind(last_response)
         .bind(last_error)
+        .bind(last_payload)
         .execute(&self.pool)
         .await?;
         Ok(())

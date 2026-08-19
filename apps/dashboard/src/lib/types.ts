@@ -96,6 +96,8 @@ export interface WebhookDelivery {
   attempts: number
   last_response: number | null
   last_error: string | null
+  /** JSON body of the most recent attempt — null until one is made. */
+  payload: Record<string, unknown> | null
   created_at: string
   updated_at: string
 }

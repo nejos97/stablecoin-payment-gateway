@@ -743,6 +743,8 @@ async fn list_webhooks(
                 "attempts": w.attempts,
                 "last_response": w.last_response,
                 "last_error": w.last_error,
+                // Body of the most recent attempt; null until one is made.
+                "payload": w.last_payload,
                 "created_at": w.created_at.to_rfc3339(),
                 "updated_at": w.updated_at.to_rfc3339(),
             })
