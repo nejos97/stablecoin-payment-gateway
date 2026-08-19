@@ -132,7 +132,7 @@ export function SectionCards() {
           </div>
           <div className="text-muted-foreground">
             {failed > 0 ? (
-              <Link to="/webhooks?status=failed" className="underline underline-offset-4">
+              <Link to="/deliveries?status=failed" className="underline underline-offset-4">
                 Review failed deliveries
               </Link>
             ) : (

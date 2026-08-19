@@ -4,8 +4,8 @@ use chrono::Utc;
 use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
 use db::StaffUserRow;
-use domain::{StaffRole, WebhookDeliveryStatus};
-use jobs::{retrigger_failed_webhooks, AppState, RetriggerError};
+use domain::{StaffRole, WebhookDeliveryStatus, WebhookEventType};
+use jobs::{retrigger_delivery, retrigger_failed_webhooks, AppState, RetriggerError};
 use redis::AsyncCommands;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -48,6 +48,10 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/auth/me", get(me))
         .route("/webhooks", get(list_webhooks))
         .route("/webhooks/retry-failed", post(retry_failed))
+        .route(
+            "/webhook-deliveries/{id}/retry",
+            post(retry_webhook_delivery),
+        )
         .route("/stats", get(stats))
         .route("/stats/deposits-timeseries", get(deposits_timeseries))
         .route(
@@ -493,6 +497,52 @@ async fn settings_json(state: &AppState) -> Result<Json<Value>, ApiError> {
     })))
 }
 
+/// API values ("pending"/"paid"/"expired") of an endpoint's subscriptions.
+fn events_to_api(events: &[String]) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter_map(|e| WebhookEventType::from_db(e).ok())
+        .map(|e| e.as_api())
+        .collect()
+}
+
+/// Parse and dedupe a request's `events` list; at least one valid event is
+/// required.
+fn parse_events(events: &[String]) -> Result<Vec<WebhookEventType>, ApiError> {
+    let mut parsed: Vec<WebhookEventType> = Vec::new();
+    for value in events {
+        let event = WebhookEventType::parse_api(value).map_err(|_| {
+            ApiError::bad_request("Invalid event: expected pending, paid or expired")
+        })?;
+        if !parsed.contains(&event) {
+            parsed.push(event);
+        }
+    }
+    if parsed.is_empty() {
+        return Err(ApiError::bad_request(
+            "At least one event is required (pending, paid or expired)",
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Validate a user-provided signing secret. Empty (after trim) means "no
+/// secret"; otherwise 16–128 printable ASCII chars without whitespace.
+fn validate_webhook_secret(secret: &str) -> Result<Option<String>, ApiError> {
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Ok(None);
+    }
+    let valid = (16..=128).contains(&secret.len())
+        && secret.chars().all(|c| c.is_ascii_graphic());
+    if !valid {
+        return Err(ApiError::bad_request(
+            "Webhook secret must be 16-128 printable ASCII characters without spaces (empty to disable signing)",
+        ));
+    }
+    Ok(Some(secret.to_string()))
+}
+
 async fn list_webhook_endpoints(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let rows = state.db.list_webhook_endpoints().await?;
     let data = rows
@@ -502,6 +552,8 @@ async fn list_webhook_endpoints(State(state): State<AppState>) -> Result<Json<Va
                 "id": e.id,
                 "url": e.url,
                 "is_active": e.is_active,
+                "events": events_to_api(&e.events),
+                "has_secret": e.has_secret,
                 "created_by": e.created_by_name,
                 "created_at": e.created_at.to_rfc3339(),
                 "updated_at": e.updated_at.to_rfc3339(),
@@ -514,6 +566,10 @@ async fn list_webhook_endpoints(State(state): State<AppState>) -> Result<Json<Va
 #[derive(Debug, Deserialize)]
 struct CreateWebhookEndpointRequest {
     url: String,
+    /// Subscribed events; absent = paid only (pre-subscription behavior).
+    events: Option<Vec<String>>,
+    /// Optional signing secret for X-Webhook-Signature (write-only).
+    secret: Option<String>,
 }
 
 async fn create_webhook_endpoint(
@@ -522,6 +578,14 @@ async fn create_webhook_endpoint(
     Json(body): Json<CreateWebhookEndpointRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let url = validate_webhook_url(&body.url)?;
+    let events = match body.events.as_deref() {
+        Some(events) => parse_events(events)?,
+        None => vec![WebhookEventType::Paid],
+    };
+    let secret = match body.secret.as_deref() {
+        Some(secret) => validate_webhook_secret(secret)?,
+        None => None,
+    };
 
     if state.db.find_webhook_endpoint_by_url(&url).await?.is_some() {
         return Err(ApiError::conflict(
@@ -529,13 +593,18 @@ async fn create_webhook_endpoint(
         ));
     }
 
-    let row = state.db.create_webhook_endpoint(&url, &current.id).await?;
+    let row = state
+        .db
+        .create_webhook_endpoint(&url, &events, secret.as_deref(), &current.id)
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "id": row.id,
             "url": row.url,
             "is_active": row.is_active,
+            "events": events_to_api(&row.events),
+            "has_secret": row.has_secret(),
             "created_at": row.created_at.to_rfc3339(),
             "updated_at": row.updated_at.to_rfc3339(),
         })),
@@ -544,7 +613,10 @@ async fn create_webhook_endpoint(
 
 #[derive(Debug, Deserialize)]
 struct UpdateWebhookEndpointRequest {
-    is_active: bool,
+    is_active: Option<bool>,
+    events: Option<Vec<String>>,
+    /// Present + non-empty = rotate; present + empty = remove signing.
+    secret: Option<String>,
 }
 
 async fn update_webhook_endpoint(
@@ -552,11 +624,36 @@ async fn update_webhook_endpoint(
     Path(id): Path<String>,
     Json(body): Json<UpdateWebhookEndpointRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let Some(row) = state
-        .db
-        .set_webhook_endpoint_active(&id, body.is_active)
-        .await?
-    else {
+    if body.is_active.is_none() && body.events.is_none() && body.secret.is_none() {
+        return Err(ApiError::bad_request("Nothing to update"));
+    }
+
+    let mut row = None;
+    if let Some(events) = body.events.as_deref() {
+        let events = parse_events(events)?;
+        row = state.db.set_webhook_endpoint_events(&id, &events).await?;
+        if row.is_none() {
+            return Err(ApiError::not_found(format!(
+                "Webhook endpoint not found: {id}"
+            )));
+        }
+    }
+    if let Some(secret) = body.secret.as_deref() {
+        let secret = validate_webhook_secret(secret)?;
+        row = state
+            .db
+            .set_webhook_endpoint_secret(&id, secret.as_deref())
+            .await?;
+        if row.is_none() {
+            return Err(ApiError::not_found(format!(
+                "Webhook endpoint not found: {id}"
+            )));
+        }
+    }
+    if let Some(is_active) = body.is_active {
+        row = state.db.set_webhook_endpoint_active(&id, is_active).await?;
+    }
+    let Some(row) = row else {
         return Err(ApiError::not_found(format!(
             "Webhook endpoint not found: {id}"
         )));
@@ -565,6 +662,8 @@ async fn update_webhook_endpoint(
         "id": row.id,
         "url": row.url,
         "is_active": row.is_active,
+        "events": events_to_api(&row.events),
+        "has_secret": row.has_secret(),
         "updated_at": row.updated_at.to_rfc3339(),
     })))
 }
@@ -623,7 +722,9 @@ async fn list_webhooks(
         .map(|w| {
             json!({
                 "id": w.id,
-                // deposits.id — what the retry endpoint expects.
+                "event": WebhookEventType::from_db(&w.event_type).map(|e| e.as_api()).unwrap_or("paid"),
+                // deposits.id — what the deposit retry endpoint expects.
+                // NULL on pending/expired event deliveries (no deposit).
                 "deposit_id": w.deposit_id,
                 // deposit_addresses.id — what the webhook payload calls deposit_id.
                 "deposit_address_id": w.deposit_address_id,
@@ -633,8 +734,11 @@ async fn list_webhooks(
                 "tx_hash": w.tx_hash,
                 "address": w.address,
                 "network": domain::Network::from_db(&w.network).map(|n| n.as_api()).unwrap_or("unknown"),
-                "amount": w.amount.normalize().to_string(),
-                "deposit_status": domain::DepositStatus::from_db(&w.deposit_status).map(|s| s.as_api()).unwrap_or("detected"),
+                // Deposit amount for paid events, expected amount otherwise.
+                "amount": w.amount.unwrap_or(w.expected_amount).normalize().to_string(),
+                "deposit_status": w.deposit_status.as_deref().map(|s| {
+                    domain::DepositStatus::from_db(s).map(|s| s.as_api()).unwrap_or("detected")
+                }),
                 "status": WebhookDeliveryStatus::from_db(&w.status).map(|s| s.as_api()).unwrap_or("pending"),
                 "attempts": w.attempts,
                 "last_response": w.last_response,
@@ -651,6 +755,33 @@ async fn list_webhooks(
         "limit": limit,
         "offset": offset,
     })))
+}
+
+/// Manual replay of one delivery row — works for every event type, unlike
+/// the historical per-deposit retry which is PAID-only.
+async fn retry_webhook_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match retrigger_delivery(&state, &id).await {
+        Ok(()) => Ok(Json(json!({ "status": "queued", "delivery_id": id }))),
+        Err(RetriggerError::DeliveryNotFound) => Err(ApiError::not_found(format!(
+            "Webhook delivery not found: {id}"
+        ))),
+        Err(RetriggerError::DepositNotFound) => {
+            Err(ApiError::not_found("Deposit not found for this delivery".into()))
+        }
+        Err(RetriggerError::DepositNotConfirmed) => {
+            Err(ApiError::bad_request("Deposit is not confirmed"))
+        }
+        Err(RetriggerError::EndpointNotEligible) => Err(ApiError::conflict(
+            "Target endpoint is inactive or no longer subscribed to this event",
+        )),
+        Err(RetriggerError::NoActiveEndpoints) => Err(ApiError::service_unavailable(
+            "No active webhook endpoints configured".into(),
+        )),
+        Err(RetriggerError::Other(err)) => Err(ApiError::internal(err.to_string())),
+    }
 }
 
 async fn retry_failed(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

@@ -8,8 +8,9 @@ Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana
 
 - Create unique deposit addresses per payment (`POST /api/v1/deposit-addresses`)
 - Monitor blockchain transfers and confirm deposits
-- Send webhooks to **every active webhook endpoint** when deposits are confirmed —
-  endpoints are managed from the dashboard (**Settings**), with per-endpoint delivery state
+- Send webhooks for payment lifecycle events — `pending` (address created), `paid`
+  (deposit confirmed), `expired` — to every active endpoint **subscribed to that event**;
+  endpoints are managed from the dashboard (**Webhooks**, admin), with per-endpoint delivery state
 - HD wallet derivation from `WALLET_MNEMONIC`
 - Multi-network support: Tron (TRC-20), Ethereum (ERC-20), Solana (SPL)
 - **Admin dashboard** (`apps/dashboard`, React + shadcn/ui): wallet balances, payments,
@@ -141,15 +142,24 @@ the acting staff member's `Authorization: Bearer <access_token>`. Requires `JWT_
 | GET/POST/PATCH | `/staff`, `/staff/{id}` | admin | List/create/update staff (roles `admin` / `operator`, activation, password) |
 | GET/POST/DELETE | `/api-keys`, `/api-keys/{id}` | admin | List/create/revoke merchant API keys (secret shown once; optional `expires_in_days` 30/90/180/365, omit for no expiry — expired keys get status `expired` and stop working) |
 | GET/PATCH | `/settings` | admin | Read/update system settings (`deposit_expiry_minutes` 1–1440, `api_key_prefix` ≤ 5 alphanum; PATCH is partial) |
-| GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints (activate/deactivate; delete only when unused) |
-| GET | `/webhooks?status=&limit=&offset=` | JWT | Latest delivery per deposit, joined with deposit + address |
-| POST | `/webhooks/retry-failed` | JWT | Bulk-requeue all failed deliveries of confirmed deposits |
+| GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints (subscribed `events` — `pending`/`paid`/`expired` — activate/deactivate; delete only when unused) |
+| GET | `/webhooks?status=&limit=&offset=` | JWT | Latest delivery per event key, joined with deposit (if any) + address |
+| POST | `/webhooks/retry-failed` | JWT | Bulk-requeue all failed deliveries (paid ones only once their deposit is confirmed) |
+| POST | `/webhook-deliveries/{id}/retry` | JWT | Replay one delivery row (works for every event type) |
 | GET | `/stats` | JWT | Counters (addresses/deposits/webhooks by status) + confirmed volume |
 | — | `/deposit-addresses*`, `/deposits/{id}/webhooks/retry`, `/balances`, `/wallet-balances` | JWT | Same handlers as `/api/v1`, JWT-authenticated for the dashboard |
 
-## Webhook payload
+## Webhook events & payloads
 
-Sent to every **active webhook endpoint** (managed in Dashboard → Settings) on confirmed deposit:
+Webhook endpoints are managed in Dashboard → Webhooks (admin). Each endpoint subscribes to one or more payment events and only receives those:
+
+| Event | Fired when | `event_type` in payload |
+|---|---|---|
+| `pending` | A deposit address is created | `payment_pending` |
+| `paid` | A deposit is confirmed on-chain | `deposit_confirmed` |
+| `expired` | A pending address passes its expiry unpaid | `payment_expired` |
+
+Payload on confirmed deposit (`paid`, unchanged historical shape):
 
 ```json
 {
@@ -168,7 +178,48 @@ Sent to every **active webhook endpoint** (managed in Dashboard → Settings) on
 }
 ```
 
-If no active webhook endpoint is configured, a warning is logged at startup and webhooks are disabled. Each delivery is tracked per (deposit, endpoint) pair; `deposits[].webhooks[]` in the deposit-address detail exposes the per-endpoint state, while `deposits[].webhook` keeps the historical single-object shape (most recent delivery).
+Payload for `pending` / `expired` (no deposit yet — `deposit_id` is the deposit-address id, like above):
+
+```json
+{
+  "event_type": "payment_pending",
+  "data": {
+    "deposit_id": "uuid",
+    "address": "T...",
+    "network": "tron",
+    "token": "USDT",
+    "expected_amount": "25",
+    "status": "pending",
+    "expires_at": "2026-08-19T12:00:00+00:00",
+    "created_at": "2026-08-19T11:00:00+00:00"
+  }
+}
+```
+
+### Signature (`X-Webhook-Signature`)
+
+Each endpoint can optionally have a **signing secret** (set at creation or rotated later in Dashboard → Webhooks; write-only — the API only ever reports `has_secret`). When set, every delivery carries:
+
+```text
+X-Webhook-Signature: sha256=<hex(HMAC-SHA256(secret, raw_body))>
+```
+
+Verify it against the **raw request body** (before any JSON parsing), using a constant-time comparison:
+
+```js
+const crypto = require("node:crypto")
+
+function verify(rawBody, header, secret) {
+  const expected = "sha256=" +
+    crypto.createHmac("sha256", secret).update(rawBody).digest("hex")
+  return header.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(header), Buffer.from(expected))
+}
+```
+
+No secret configured → no header. The signature covers the body only (no timestamp): if replay matters to you, deduplicate on `(event_type, data.deposit_id, data.tx_hash)` on your side.
+
+If no active webhook endpoint is configured, a warning is logged at startup and webhooks are disabled. Each delivery is tracked per (deposit, endpoint) pair for `paid` and per (address, event, endpoint) for `pending`/`expired`; `deposits[].webhooks[]` in the deposit-address detail exposes the per-endpoint state, while `deposits[].webhook` keeps the historical single-object shape (most recent delivery).
 
 Delivery is attempted up to 5 times with increasing gaps — 90s, 4m30, 13m30, 40m30 — so the 5th and final attempt starts ~1h after the first. After that the delivery is marked `failed` and can only be resent via the retry endpoint. Receivers must treat replays as the same event (idempotent on their side).
 
@@ -216,7 +267,7 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 
 Advanced overrides (code defaults if unset): `POLLING_INTERVAL_SECONDS` (10), `ETH_CONFIRMATIONS` (12), `TRON_CONFIRMATIONS` (19), `AMOUNT_TOLERANCE_PERCENT` (1).
 
-Webhook endpoints and the default payment expiry (60 min, max 24 h) are **not** environment variables — they are stored in the database and managed from Dashboard → Settings (admin only).
+Webhook endpoints (Dashboard → Webhooks) and the default payment expiry (60 min, max 24 h; Dashboard → Settings) are **not** environment variables — they are stored in the database and managed from the dashboard (admin only).
 
 ## USDT contracts
 

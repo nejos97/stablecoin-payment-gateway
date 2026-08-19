@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use domain::{
-    DepositAddressStatus, DepositStatus, Network, Token, WebhookDeliveryStatus,
+    DepositAddressStatus, DepositStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -31,7 +31,7 @@ pub struct Db {
 // are UTC instants) instead of using SELECT * / RETURNING *.
 const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
-const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct DepositAddressRow {
@@ -74,8 +74,14 @@ pub struct DepositRow {
 #[derive(Debug, Clone, FromRow)]
 pub struct WebhookDeliveryRow {
     pub id: String,
+    /// NULL on PENDING/EXPIRED event deliveries (no deposit involved).
     #[sqlx(rename = "depositId")]
-    pub deposit_id: String,
+    pub deposit_id: Option<String>,
+    #[sqlx(rename = "depositAddressId")]
+    pub deposit_address_id: String,
+    /// DB value of the `WebhookEventType` this delivery notifies.
+    #[sqlx(rename = "eventType")]
+    pub event_type: String,
     /// NULL on rows written before per-endpoint deliveries existed.
     #[sqlx(rename = "webhookEndpointId")]
     pub webhook_endpoint_id: Option<String>,
@@ -237,17 +243,22 @@ impl Db {
         Ok(rows)
     }
 
-    pub async fn expire_stale_addresses(&self) -> Result<u64> {
-        let result = sqlx::query(
+    /// Transition past-deadline PENDING addresses to EXPIRED. Returns the ids
+    /// of the addresses expired by THIS call (the UPDATE is atomic, so a
+    /// concurrent caller gets an empty set) — callers fire EXPIRED webhooks
+    /// for them exactly once.
+    pub async fn expire_stale_addresses(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
             r#"
             UPDATE deposit_addresses
             SET status = 'EXPIRED'::"DepositAddressStatus", "updatedAt" = NOW()
             WHERE status = 'PENDING'::"DepositAddressStatus" AND "expiresAt" < NOW()
+            RETURNING id
             "#,
         )
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(result.rows_affected())
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     pub async fn pending_addresses(&self, network: Network) -> Result<Vec<DepositAddressRow>> {
@@ -405,15 +416,23 @@ impl Db {
         if let Some(row) = self.find_webhook_delivery(deposit_id, endpoint_id).await? {
             return Ok(row);
         }
+        self.insert_paid_webhook_delivery(deposit_id, endpoint_id).await
+    }
 
+    /// New PAID delivery row; `depositAddressId` is resolved from the deposit.
+    async fn insert_paid_webhook_delivery(
+        &self,
+        deposit_id: &str,
+        endpoint_id: &str,
+    ) -> Result<WebhookDeliveryRow> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
             r#"
             INSERT INTO webhook_deliveries
-              (id, "depositId", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
-            VALUES
-              ($1, $2, $3, 'PENDING'::"WebhookDeliveryStatus", 0, $4, $4)
+              (id, "depositId", "depositAddressId", "eventType", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
+            SELECT $1, d.id, d."depositAddressId", 'PAID', $3, 'PENDING'::"WebhookDeliveryStatus", 0, $4, $4
+            FROM deposits d WHERE d.id = $2
             RETURNING {WEBHOOK_DELIVERY_COLUMNS}
             "#
         ))
@@ -422,6 +441,97 @@ impl Db {
         .bind(endpoint_id)
         .bind(now)
         .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Get-or-create for an address-scoped event delivery (PENDING/EXPIRED —
+    /// no deposit involved), keyed on (address, event, endpoint).
+    pub async fn get_or_create_address_webhook_delivery(
+        &self,
+        address_id: &str,
+        event: WebhookEventType,
+        endpoint_id: &str,
+    ) -> Result<WebhookDeliveryRow> {
+        if let Some(row) = self
+            .find_address_webhook_delivery(address_id, event, endpoint_id)
+            .await?
+        {
+            return Ok(row);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            INSERT INTO webhook_deliveries
+              (id, "depositAddressId", "eventType", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
+            VALUES
+              ($1, $2, $3, $4, 'PENDING'::"WebhookDeliveryStatus", 0, $5, $5)
+            RETURNING {WEBHOOK_DELIVERY_COLUMNS}
+            "#
+        ))
+        .bind(&id)
+        .bind(address_id)
+        .bind(event.as_db())
+        .bind(endpoint_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Most recent delivery row for an (address, event, endpoint) triple.
+    pub async fn find_address_webhook_delivery(
+        &self,
+        address_id: &str,
+        event: WebhookEventType,
+        endpoint_id: &str,
+    ) -> Result<Option<WebhookDeliveryRow>> {
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            SELECT {WEBHOOK_DELIVERY_COLUMNS} FROM webhook_deliveries
+            WHERE "depositAddressId" = $1 AND "eventType" = $2 AND "webhookEndpointId" = $3
+            ORDER BY "createdAt" DESC LIMIT 1
+            "#
+        ))
+        .bind(address_id)
+        .bind(event.as_db())
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn find_webhook_delivery_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<WebhookDeliveryRow>> {
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            "SELECT {WEBHOOK_DELIVERY_COLUMNS} FROM webhook_deliveries WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Reset one delivery row to PENDING / 0 attempts for a manual replay.
+    pub async fn reset_webhook_delivery_by_id(&self, id: &str) -> Result<Option<WebhookDeliveryRow>> {
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            UPDATE webhook_deliveries
+            SET status = 'PENDING'::"WebhookDeliveryStatus",
+                attempts = 0,
+                "lastResponse" = NULL,
+                "lastError" = NULL,
+                "updatedAt" = NOW()
+            WHERE id = $1
+            RETURNING {WEBHOOK_DELIVERY_COLUMNS}
+            "#
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
@@ -489,24 +599,7 @@ impl Db {
             return Ok(row);
         }
 
-        let id = Uuid::new_v4().to_string();
-        let now = Utc::now();
-        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
-            r#"
-            INSERT INTO webhook_deliveries
-              (id, "depositId", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
-            VALUES
-              ($1, $2, $3, 'PENDING'::"WebhookDeliveryStatus", 0, $4, $4)
-            RETURNING {WEBHOOK_DELIVERY_COLUMNS}
-            "#
-        ))
-        .bind(&id)
-        .bind(deposit_id)
-        .bind(endpoint_id)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row)
+        self.insert_paid_webhook_delivery(deposit_id, endpoint_id).await
     }
 
     pub async fn update_webhook_delivery(

@@ -4,6 +4,7 @@ import {
   KeyRoundIcon,
   LayoutDashboardIcon,
   ReceiptTextIcon,
+  SendIcon,
   SettingsIcon,
   UsersIcon,
   WalletIcon,
@@ -30,12 +31,13 @@ import { useAuth } from "@/lib/auth"
 const NAV_MAIN: NavItem[] = [
   { title: "Overview", url: "/", icon: <LayoutDashboardIcon /> },
   { title: "Payments", url: "/payments", icon: <ReceiptTextIcon /> },
-  { title: "Webhooks", url: "/webhooks", icon: <WebhookIcon /> },
+  { title: "Deliveries", url: "/deliveries", icon: <SendIcon /> },
   { title: "Wallets", url: "/wallets", icon: <WalletIcon /> },
 ]
 
 const NAV_ADMIN: NavItem[] = [
   { title: "API Keys", url: "/api-keys", icon: <KeyRoundIcon /> },
+  { title: "Webhooks", url: "/webhooks", icon: <WebhookIcon /> },
   { title: "Staff", url: "/staff", icon: <UsersIcon /> },
   { title: "Settings", url: "/settings", icon: <SettingsIcon /> },
 ]

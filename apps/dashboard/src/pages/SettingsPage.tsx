@@ -1,19 +1,8 @@
 import { useEffect, useState } from "react"
-import { KeyRound, Plus, Webhook } from "lucide-react"
+import { KeyRound } from "lucide-react"
 import { toast } from "sonner"
 
 import { QueryError } from "@/components/shared/QueryError"
-import { StatusBadge } from "@/components/shared/StatusBadge"
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -22,17 +11,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import {
   Select,
   SelectContent,
@@ -41,24 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
-import { Switch } from "@/components/ui/switch"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import {
-  useCreateWebhookEndpoint,
-  useSettings,
-  useToggleWebhookEndpoint,
-  useUpdateSettings,
-  useWebhookEndpoints,
-} from "@/hooks/queries"
-import { formatDate } from "@/lib/format"
-import type { WebhookEndpoint } from "@/lib/types"
+import { useSettings, useUpdateSettings } from "@/hooks/queries"
 
 const EXPIRY_OPTIONS = [
   { value: 15, label: "15 minutes" },
@@ -76,12 +38,11 @@ export function SettingsPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">
-          System configuration — payment expiry and outgoing webhooks.
+          System configuration — payment expiry and API key prefix.
         </p>
       </div>
       <PaymentExpiryCard />
       <ApiKeyPrefixCard />
-      <WebhookEndpointsCard />
     </div>
   )
 }
@@ -214,183 +175,3 @@ function PaymentExpiryCard() {
   )
 }
 
-function WebhookEndpointsCard() {
-  const endpoints = useWebhookEndpoints()
-  const toggleEndpoint = useToggleWebhookEndpoint()
-  const [deactivating, setDeactivating] = useState<WebhookEndpoint | null>(null)
-
-  async function setActive(endpoint: WebhookEndpoint, isActive: boolean) {
-    try {
-      await toggleEndpoint.mutateAsync({ id: endpoint.id, is_active: isActive })
-      toast.success(isActive ? "Endpoint activated" : "Endpoint deactivated")
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Update failed")
-    } finally {
-      setDeactivating(null)
-    }
-  }
-
-  return (
-    <Card>
-      <CardHeader className="flex flex-row items-start justify-between gap-4 space-y-0">
-        <div className="space-y-1.5">
-          <CardTitle>Webhook endpoints</CardTitle>
-          <CardDescription>
-            Confirmed deposits are notified to every active endpoint. No active
-            endpoint means no webhooks are sent.
-          </CardDescription>
-        </div>
-        <AddEndpointDialog />
-      </CardHeader>
-      <CardContent>
-        {endpoints.isError ? (
-          <QueryError error={endpoints.error} />
-        ) : endpoints.isLoading ? (
-          <Skeleton className="h-40 w-full" />
-        ) : (
-          <div className="rounded-lg border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>URL</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Created by</TableHead>
-                  <TableHead>Created</TableHead>
-                  <TableHead>Updated</TableHead>
-                  <TableHead className="text-right">Active</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {endpoints.data?.data.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={6} className="h-24 text-center text-muted-foreground">
-                      No webhook endpoints yet — outgoing webhooks are disabled.
-                    </TableCell>
-                  </TableRow>
-                )}
-                {endpoints.data?.data.map((endpoint) => (
-                  <TableRow key={endpoint.id}>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <Webhook className="size-3.5 shrink-0 text-muted-foreground" />
-                        <code className="max-w-96 truncate text-xs">{endpoint.url}</code>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <StatusBadge status={endpoint.is_active ? "active" : "inactive"} />
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">
-                      {endpoint.created_by ?? "—"}
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">
-                      {formatDate(endpoint.created_at)}
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">
-                      {formatDate(endpoint.updated_at)}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <Switch
-                        checked={endpoint.is_active}
-                        disabled={toggleEndpoint.isPending}
-                        onCheckedChange={(checked) => {
-                          if (checked) {
-                            setActive(endpoint, true)
-                          } else {
-                            setDeactivating(endpoint)
-                          }
-                        }}
-                        aria-label={`Toggle ${endpoint.url}`}
-                      />
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-        )}
-      </CardContent>
-
-      <AlertDialog
-        open={deactivating !== null}
-        onOpenChange={(open) => !open && setDeactivating(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Deactivate this endpoint?</AlertDialogTitle>
-            <AlertDialogDescription className="break-all">
-              {deactivating?.url} will stop receiving webhooks immediately —
-              queued deliveries towards it will be skipped. You can reactivate
-              it at any time.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => deactivating && setActive(deactivating, false)}
-            >
-              Deactivate
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </Card>
-  )
-}
-
-function AddEndpointDialog() {
-  const [open, setOpen] = useState(false)
-  const [url, setUrl] = useState("")
-  const createEndpoint = useCreateWebhookEndpoint()
-
-  async function handleCreate() {
-    const trimmed = url.trim()
-    if (!/^https?:\/\/.+/.test(trimmed)) {
-      toast.error("URL must start with http:// or https://")
-      return
-    }
-    try {
-      await createEndpoint.mutateAsync(trimmed)
-      toast.success("Webhook endpoint added")
-      setOpen(false)
-      setUrl("")
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Creation failed")
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button size="sm">
-          <Plus className="size-4" /> Add endpoint
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Add webhook endpoint</DialogTitle>
-          <DialogDescription>
-            This URL will receive a POST for every confirmed deposit, with
-            automatic retries on failure.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-2">
-          <Label htmlFor="endpoint-url">URL</Label>
-          <Input
-            id="endpoint-url"
-            placeholder="https://example.com/webhooks/deposits"
-            value={url}
-            onChange={(event) => setUrl(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") handleCreate()
-            }}
-          />
-        </div>
-        <DialogFooter>
-          <Button onClick={handleCreate} disabled={createEndpoint.isPending}>
-            {createEndpoint.isPending ? "Adding…" : "Add endpoint"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}

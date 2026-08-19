@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+auth = { workspace = true }
 chain = { workspace = true }
 chrono.workspace = true
 config = { workspace = true }

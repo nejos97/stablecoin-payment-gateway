@@ -312,6 +312,7 @@ dependencies = [
  "chrono",
  "domain",
  "hex",
+ "hmac 0.12.1",
  "jsonwebtoken",
  "rand 0.8.7",
  "serde",
@@ -2105,6 +2106,7 @@ name = "jobs"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "auth",
  "chain",
  "chrono",
  "config",

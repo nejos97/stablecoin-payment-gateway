@@ -191,6 +191,64 @@ impl WebhookDeliveryStatus {
     }
 }
 
+/// Address lifecycle event a webhook endpoint can subscribe to. Mirrors
+/// `DepositAddressStatus`: PENDING fires at address creation, PAID at deposit
+/// confirmation, EXPIRED when the address expires unpaid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WebhookEventType {
+    Pending,
+    Paid,
+    Expired,
+}
+
+impl WebhookEventType {
+    pub const ALL: [Self; 3] = [Self::Pending, Self::Paid, Self::Expired];
+
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Paid => "PAID",
+            Self::Expired => "EXPIRED",
+        }
+    }
+
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Paid => "paid",
+            Self::Expired => "expired",
+        }
+    }
+
+    /// `event_type` value sent in the webhook payload. `deposit_confirmed`
+    /// predates event subscriptions and must not change (existing receivers).
+    pub fn payload_event_type(&self) -> &'static str {
+        match self {
+            Self::Pending => "payment_pending",
+            Self::Paid => "deposit_confirmed",
+            Self::Expired => "payment_expired",
+        }
+    }
+
+    pub fn parse_api(value: &str) -> Result<Self, DomainError> {
+        match value.to_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "paid" => Ok(Self::Paid),
+            "expired" => Ok(Self::Expired),
+            _ => Err(DomainError::InvalidStatus(value.to_string())),
+        }
+    }
+
+    pub fn from_db(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "PAID" => Ok(Self::Paid),
+            "EXPIRED" => Ok(Self::Expired),
+            _ => Err(DomainError::InvalidStatus(value.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiKeyStatus {
     Active,

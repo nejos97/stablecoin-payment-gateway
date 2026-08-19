@@ -160,6 +160,18 @@ pub fn constant_time_eq_hex(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+/// `X-Webhook-Signature` value for an outgoing webhook: HMAC-SHA256 of the
+/// exact body bytes sent, keyed by the endpoint's secret, GitHub-style
+/// (`sha256=<hex>`). Receivers recompute it over the raw body and compare
+/// constant-time.
+pub fn webhook_signature(secret: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
 fn random_alphanumeric(len: usize) -> String {
     OsRng
         .sample_iter(&Alphanumeric)
@@ -261,5 +273,24 @@ mod tests {
         assert_eq!(h1, sha256_hex(&t1));
         assert!(constant_time_eq_hex(&h1, &sha256_hex(&t1)));
         assert!(!constant_time_eq_hex(&h1, &h2));
+    }
+
+    #[test]
+    fn webhook_signature_matches_rfc4231_vector() {
+        // RFC 4231 test case 2 (HMAC-SHA-256).
+        assert_eq!(
+            webhook_signature("Jefe", b"what do ya want for nothing?"),
+            "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn webhook_signature_depends_on_secret_and_body() {
+        let body = br#"{"event_type":"deposit_confirmed"}"#;
+        let sig = webhook_signature("secret-a", body);
+        assert!(sig.starts_with("sha256="));
+        assert_eq!(sig.len(), "sha256=".len() + 64);
+        assert_ne!(sig, webhook_signature("secret-b", body));
+        assert_ne!(sig, webhook_signature("secret-a", b"{}"));
     }
 }

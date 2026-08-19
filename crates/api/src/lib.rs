@@ -8,8 +8,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use db::{DepositAddressRow, WebhookDeliveryRow};
-use domain::{DepositAddressStatus, Network, Token, WebhookDeliveryStatus};
-use jobs::{get_cached_wallet_balances, get_live_balances, retrigger_webhook, AppState, RetriggerError};
+use domain::{DepositAddressStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType};
+use jobs::{
+    expire_addresses_and_notify, get_cached_wallet_balances, get_live_balances,
+    notify_address_event, retrigger_webhook, AppState, RetriggerError,
+};
 use rust_decimal::Decimal;
 use axum::http::HeaderValue;
 use serde::{Deserialize, Serialize};
@@ -162,6 +165,12 @@ async fn create_deposit_address(
         )
         .await?;
 
+    // The address is created PENDING — fan out the PENDING event to the
+    // subscribed endpoints. A queueing failure must not fail the creation.
+    if let Err(err) = notify_address_event(&state, &row.id, WebhookEventType::Pending).await {
+        tracing::warn!("Failed to queue PENDING webhook for address {}: {err:#}", row.id);
+    }
+
     Ok((StatusCode::CREATED, Json(to_response(&row)?)))
 }
 
@@ -169,7 +178,7 @@ async fn list_deposit_addresses(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    let _ = state.db.expire_stale_addresses().await?;
+    let _ = expire_addresses_and_notify(&state).await?;
 
     let status = query
         .status
@@ -223,8 +232,13 @@ async fn get_deposit_address(
         .find_webhook_deliveries_for_deposits(&deposit_ids)
         .await?
     {
+        // Rows fetched by deposit id always carry one; keep the guard for
+        // type honesty (address-scoped deliveries have no deposit).
+        let Some(deposit_id) = delivery.deposit_id.clone() else {
+            continue;
+        };
         deliveries
-            .entry((delivery.deposit_id.clone(), delivery.webhook_endpoint_id.clone()))
+            .entry((deposit_id, delivery.webhook_endpoint_id.clone()))
             .or_insert(delivery);
     }
     let endpoint_urls: HashMap<String, String> = state
@@ -319,6 +333,7 @@ async fn retry_deposit_webhook(
             "No active webhook endpoints configured".into(),
         )),
         Err(RetriggerError::Other(err)) => Err(ApiError::internal(err.to_string())),
+        Err(err) => Err(ApiError::internal(format!("{err:?}"))),
     }
 }
 

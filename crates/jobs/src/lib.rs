@@ -8,9 +8,10 @@ use config::{
     WALLET_BALANCE_SYNC_INTERVAL_SECS, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_RETRY_DELAYS_SECS,
 };
 use db::Db;
+use db::DepositAddressRow;
 use domain::{
     raw_to_decimal, raw_to_decimal_string, required_confirmations, DetectedTransfer,
-    DepositAddressStatus, DepositStatus, Network, WebhookDeliveryStatus,
+    DepositAddressStatus, DepositStatus, Network, WebhookDeliveryStatus, WebhookEventType,
     is_amount_within_tolerance,
 };
 use redis::aio::ConnectionManager;
@@ -99,11 +100,16 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
         )
         .await?;
 
-    // Fan out to every active endpoint; no endpoints configured is a no-op.
+    // Fan out to every active endpoint subscribed to the PAID event; no
+    // endpoints configured is a no-op.
     if is_confirmed {
-        for endpoint in state.db.active_webhook_endpoints().await? {
+        for endpoint in state
+            .db
+            .active_webhook_endpoints_for_event(WebhookEventType::Paid)
+            .await?
+        {
             if !state.db.has_delivered_webhook(&deposit.id, &endpoint.id).await? {
-                enqueue_webhook(state, &deposit.id, &endpoint.id).await?;
+                enqueue_webhook(state, WebhookEventType::Paid, &deposit.id, &endpoint.id).await?;
             }
         }
     }
@@ -111,30 +117,83 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
     Ok(())
 }
 
-/// ZSET member for a scheduled delivery. Both ids are UUIDs (`[0-9a-f-]`),
-/// so `|` can never appear inside them.
-pub fn encode_queue_member(deposit_id: &str, endpoint_id: &str) -> String {
-    format!("{deposit_id}|{endpoint_id}")
+/// Fan an address lifecycle event (PENDING at creation, EXPIRED at expiry)
+/// out to every active endpoint subscribed to it. Returns the number of
+/// deliveries queued; none subscribed is a no-op.
+pub async fn notify_address_event(
+    state: &AppState,
+    address_id: &str,
+    event: WebhookEventType,
+) -> Result<usize> {
+    let endpoints = state.db.active_webhook_endpoints_for_event(event).await?;
+    for endpoint in &endpoints {
+        enqueue_webhook(state, event, address_id, &endpoint.id).await?;
+    }
+    Ok(endpoints.len())
 }
 
-/// `None` for legacy members written before per-endpoint deliveries (a bare
-/// deposit id) — the webhook loop fans those out to all active endpoints.
-pub fn decode_queue_member(member: &str) -> Option<(&str, &str)> {
-    member
-        .split_once('|')
-        .filter(|(deposit, endpoint)| !deposit.is_empty() && !endpoint.is_empty())
+/// Expire past-deadline addresses and queue the EXPIRED webhook for each
+/// newly expired one. Returns the number of addresses expired.
+pub async fn expire_addresses_and_notify(state: &AppState) -> Result<u64> {
+    let expired_ids = state.db.expire_stale_addresses().await?;
+    for address_id in &expired_ids {
+        if let Err(err) =
+            notify_address_event(state, address_id, WebhookEventType::Expired).await
+        {
+            warn!("Failed to queue EXPIRED webhook for address {address_id}: {err:#}");
+        }
+    }
+    Ok(expired_ids.len() as u64)
+}
+
+/// ZSET member for a scheduled delivery. PAID keeps the historical 2-part
+/// `"{deposit_id}|{endpoint_id}"` shape; address-scoped events are
+/// `"{EVENT}|{address_id}|{endpoint_id}"`. Ids are UUIDs (`[0-9a-f-]`), so
+/// `|` can never appear inside them.
+pub fn encode_queue_member(
+    event: WebhookEventType,
+    subject_id: &str,
+    endpoint_id: &str,
+) -> String {
+    match event {
+        WebhookEventType::Paid => format!("{subject_id}|{endpoint_id}"),
+        other => format!("{}|{subject_id}|{endpoint_id}", other.as_db()),
+    }
+}
+
+/// `(event, subject_id, endpoint_id)` — subject is a deposit id for PAID and
+/// a deposit-address id otherwise. `None` for legacy members written before
+/// per-endpoint deliveries (a bare deposit id) — the webhook loop fans those
+/// out to all active PAID endpoints.
+pub fn decode_queue_member(member: &str) -> Option<(WebhookEventType, &str, &str)> {
+    let parts: Vec<&str> = member.split('|').collect();
+    match parts.as_slice() {
+        [deposit, endpoint] if !deposit.is_empty() && !endpoint.is_empty() => {
+            Some((WebhookEventType::Paid, deposit, endpoint))
+        }
+        [event, subject, endpoint] if !subject.is_empty() && !endpoint.is_empty() => {
+            let event = WebhookEventType::from_db(event).ok()?;
+            Some((event, subject, endpoint))
+        }
+        _ => None,
+    }
 }
 
 /// Schedule a delivery attempt for "now". ZSET members are unique, so
-/// re-enqueueing a pair that already has a scheduled retry simply moves it
+/// re-enqueueing a key that already has a scheduled retry simply moves it
 /// forward instead of adding a duplicate.
-pub async fn enqueue_webhook(state: &AppState, deposit_id: &str, endpoint_id: &str) -> Result<()> {
+pub async fn enqueue_webhook(
+    state: &AppState,
+    event: WebhookEventType,
+    subject_id: &str,
+    endpoint_id: &str,
+) -> Result<()> {
     let key = state.config.redis_key(WEBHOOK_ZSET_KEY);
     let mut redis = state.redis.clone();
     let _: () = redis
         .zadd(
             key,
-            encode_queue_member(deposit_id, endpoint_id),
+            encode_queue_member(event, subject_id, endpoint_id),
             chrono::Utc::now().timestamp(),
         )
         .await?;
@@ -166,6 +225,9 @@ pub enum DeliveryOutcome {
 pub enum RetriggerError {
     DepositNotFound,
     DepositNotConfirmed,
+    DeliveryNotFound,
+    /// Target endpoint is inactive or no longer subscribed to the event.
+    EndpointNotEligible,
     NoActiveEndpoints,
     Other(anyhow::Error),
 }
@@ -176,16 +238,19 @@ impl From<anyhow::Error> for RetriggerError {
     }
 }
 
-/// Manual replay for the dashboard: for every active endpoint, reset the
-/// delivery row to PENDING / 0 attempts, then schedule an immediate attempt.
-/// Never touches `deposits` or `deposit_addresses`.
+/// Manual replay for the dashboard: for every active PAID-subscribed
+/// endpoint, reset the delivery row to PENDING / 0 attempts, then schedule an
+/// immediate attempt. Never touches `deposits` or `deposit_addresses`.
 pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(), RetriggerError> {
     let deposit = state
         .db
         .find_deposit(deposit_id)
         .await?
         .ok_or(RetriggerError::DepositNotFound)?;
-    let endpoints = state.db.active_webhook_endpoints().await?;
+    let endpoints = state
+        .db
+        .active_webhook_endpoints_for_event(WebhookEventType::Paid)
+        .await?;
     if endpoints.is_empty() {
         return Err(RetriggerError::NoActiveEndpoints);
     }
@@ -195,7 +260,7 @@ pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(),
 
     for endpoint in &endpoints {
         state.db.reset_webhook_delivery(&deposit.id, &endpoint.id).await?;
-        enqueue_webhook(state, &deposit.id, &endpoint.id).await?;
+        enqueue_webhook(state, WebhookEventType::Paid, &deposit.id, &endpoint.id).await?;
     }
     info!(
         "Webhook retriggered for deposit {deposit_id} towards {} endpoint(s)",
@@ -204,34 +269,109 @@ pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(),
     Ok(())
 }
 
-/// Bulk manual replay: re-queue every (deposit, endpoint) pair whose
-/// authoritative delivery is FAILED; legacy rows (no endpoint) fan out to all
-/// active endpoints. Individual failures are logged and skipped; returns the
-/// number of pairs successfully re-queued.
+/// Manual replay of one delivery row (any event type): reset it to PENDING /
+/// 0 attempts and schedule an immediate attempt. Legacy rows (no endpoint)
+/// fall back to the per-deposit replay towards all PAID endpoints.
+pub async fn retrigger_delivery(state: &AppState, delivery_id: &str) -> Result<(), RetriggerError> {
+    let delivery = state
+        .db
+        .find_webhook_delivery_by_id(delivery_id)
+        .await?
+        .ok_or(RetriggerError::DeliveryNotFound)?;
+    let event = WebhookEventType::from_db(&delivery.event_type)
+        .map_err(|e| RetriggerError::Other(e.into()))?;
+
+    let Some(endpoint_id) = delivery.webhook_endpoint_id.clone() else {
+        let deposit_id = delivery.deposit_id.ok_or(RetriggerError::DeliveryNotFound)?;
+        return retrigger_webhook(state, &deposit_id).await;
+    };
+
+    let endpoint = state
+        .db
+        .find_webhook_endpoint(&endpoint_id)
+        .await?
+        .ok_or(RetriggerError::EndpointNotEligible)?;
+    if !endpoint.is_active || !endpoint.accepts_event(event) {
+        return Err(RetriggerError::EndpointNotEligible);
+    }
+
+    let subject_id = match event {
+        WebhookEventType::Paid => {
+            let deposit_id = delivery.deposit_id.ok_or(RetriggerError::DeliveryNotFound)?;
+            let deposit = state
+                .db
+                .find_deposit(&deposit_id)
+                .await?
+                .ok_or(RetriggerError::DepositNotFound)?;
+            if deposit.status != DepositStatus::Confirmed.as_db() {
+                return Err(RetriggerError::DepositNotConfirmed);
+            }
+            deposit_id
+        }
+        _ => delivery.deposit_address_id.clone(),
+    };
+
+    state.db.reset_webhook_delivery_by_id(&delivery.id).await?;
+    enqueue_webhook(state, event, &subject_id, &endpoint_id).await?;
+    info!("Webhook delivery {delivery_id} retriggered ({} event)", event.as_api());
+    Ok(())
+}
+
+/// Bulk manual replay: re-queue every delivery key whose authoritative
+/// delivery is FAILED; legacy rows (no endpoint) fan out to all active
+/// PAID-subscribed endpoints. Individual failures are logged and skipped;
+/// returns the number of keys successfully re-queued.
 pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, RetriggerError> {
     let endpoints = state.db.active_webhook_endpoints().await?;
     if endpoints.is_empty() {
         return Err(RetriggerError::NoActiveEndpoints);
     }
+    let paid_endpoints: Vec<&str> = endpoints
+        .iter()
+        .filter(|e| e.accepts_event(WebhookEventType::Paid))
+        .map(|e| e.id.as_str())
+        .collect();
 
     let targets = state.db.failed_webhook_targets().await?;
     let mut retried = 0usize;
-    for (deposit_id, endpoint_id) in &targets {
-        let target_endpoints: Vec<&str> = match endpoint_id {
+    for target in &targets {
+        let Ok(event) = WebhookEventType::from_db(&target.event_type) else {
+            warn!("Bulk webhook retry skipped unknown event type {}", target.event_type);
+            continue;
+        };
+        let subject_id = match event {
+            WebhookEventType::Paid => match target.deposit_id.as_deref() {
+                Some(id) => id,
+                None => continue,
+            },
+            _ => target.deposit_address_id.as_str(),
+        };
+        let target_endpoints: Vec<&str> = match &target.webhook_endpoint_id {
             Some(id) => vec![id.as_str()],
-            // Legacy failure — replay towards every active endpoint.
-            None => endpoints.iter().map(|e| e.id.as_str()).collect(),
+            // Legacy failure — replay towards every active PAID endpoint.
+            None => paid_endpoints.clone(),
         };
         for endpoint_id in target_endpoints {
             let result: Result<()> = async {
-                state.db.reset_webhook_delivery(deposit_id, endpoint_id).await?;
-                enqueue_webhook(state, deposit_id, endpoint_id).await
+                match event {
+                    WebhookEventType::Paid => {
+                        state.db.reset_webhook_delivery(subject_id, endpoint_id).await?;
+                    }
+                    _ => {
+                        let row = state
+                            .db
+                            .get_or_create_address_webhook_delivery(subject_id, event, endpoint_id)
+                            .await?;
+                        state.db.reset_webhook_delivery_by_id(&row.id).await?;
+                    }
+                }
+                enqueue_webhook(state, event, subject_id, endpoint_id).await
             }
             .await;
             match result {
                 Ok(()) => retried += 1,
                 Err(err) => {
-                    warn!("Bulk webhook retry skipped deposit {deposit_id} endpoint {endpoint_id}: {err:#}")
+                    warn!("Bulk webhook retry skipped {} {subject_id} endpoint {endpoint_id}: {err:#}", event.as_api())
                 }
             }
         }
@@ -240,61 +380,92 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
     Ok(retried)
 }
 
+/// Deliver one queued webhook. `subject_id` is a deposit id for PAID and a
+/// deposit-address id for PENDING/EXPIRED.
 pub async fn deliver_webhook(
     state: &AppState,
-    deposit_id: &str,
+    event: WebhookEventType,
+    subject_id: &str,
     endpoint_id: &str,
 ) -> Result<DeliveryOutcome> {
-    // Reload the endpoint on every attempt so a deactivation takes effect
-    // immediately: the queued member is consumed without being rescheduled.
+    // Reload the endpoint on every attempt so a deactivation or an event
+    // unsubscription takes effect immediately: the queued member is consumed
+    // without being rescheduled.
     let endpoint = match state.db.find_webhook_endpoint(endpoint_id).await? {
-        Some(endpoint) if endpoint.is_active => endpoint,
+        Some(endpoint) if endpoint.is_active && endpoint.accepts_event(event) => endpoint,
         _ => {
-            warn!("Webhook delivery skipped for deposit {deposit_id} — endpoint {endpoint_id} is inactive or gone");
+            warn!(
+                "Webhook delivery skipped for {} {subject_id} — endpoint {endpoint_id} is inactive, gone or unsubscribed",
+                event.as_api()
+            );
             return Ok(DeliveryOutcome::Skipped);
         }
     };
     let webhook_url = &endpoint.url;
-
-    let Some(deposit) = state.db.find_deposit(deposit_id).await? else {
-        anyhow::bail!("Deposit not found: {deposit_id}");
-    };
-    let Some(address) = state.db.find_deposit_address(&deposit.deposit_address_id).await? else {
-        anyhow::bail!("Deposit address not found for deposit {deposit_id}");
+    let subject_label = match event {
+        WebhookEventType::Paid => format!("deposit {subject_id}"),
+        _ => format!("address {subject_id} ({})", event.as_api()),
     };
 
-    let delivery = state
-        .db
-        .get_or_create_webhook_delivery(deposit_id, endpoint_id)
-        .await?;
+    let (delivery, payload) = match event {
+        WebhookEventType::Paid => {
+            let Some(deposit) = state.db.find_deposit(subject_id).await? else {
+                anyhow::bail!("Deposit not found: {subject_id}");
+            };
+            let Some(address) = state.db.find_deposit_address(&deposit.deposit_address_id).await?
+            else {
+                anyhow::bail!("Deposit address not found for deposit {subject_id}");
+            };
+            let delivery = state
+                .db
+                .get_or_create_webhook_delivery(subject_id, endpoint_id)
+                .await?;
+            let network = Network::from_db(&address.network)?;
+            // Historical shape — `data.deposit_id` is deposit_addresses.id
+            // on purpose (see AGENTS.md); existing receivers depend on it.
+            let payload = serde_json::json!({
+                "event_type": event.payload_event_type(),
+                "data": {
+                    "deposit_id": deposit.deposit_address_id,
+                    "address": address.address,
+                    "network": network.as_api(),
+                    "token": address.token,
+                    "amount": deposit.amount.to_string(),
+                    "amount_raw": deposit.amount_raw,
+                    "tx_hash": deposit.tx_hash,
+                    "confirmations": deposit.confirmations,
+                    "status": "confirmed",
+                },
+            });
+            (delivery, payload)
+        }
+        WebhookEventType::Pending | WebhookEventType::Expired => {
+            let Some(address) = state.db.find_deposit_address(subject_id).await? else {
+                anyhow::bail!("Deposit address not found: {subject_id}");
+            };
+            let delivery = state
+                .db
+                .get_or_create_address_webhook_delivery(subject_id, event, endpoint_id)
+                .await?;
+            (delivery, address_event_payload(event, &address)?)
+        }
+    };
+
     if delivery.status == WebhookDeliveryStatus::Delivered.as_db() {
         return Ok(DeliveryOutcome::Delivered);
     }
 
-    let network = Network::from_db(&address.network)?;
-    let payload = WebhookPayload {
-        event_type: "deposit_confirmed",
-        data: WebhookData {
-            deposit_id: deposit.deposit_address_id.clone(),
-            address: address.address.clone(),
-            network: network.as_api().to_string(),
-            token: address.token.clone(),
-            amount: deposit.amount.to_string(),
-            amount_raw: deposit.amount_raw.clone(),
-            tx_hash: deposit.tx_hash.clone(),
-            confirmations: deposit.confirmations,
-            status: "confirmed",
-        },
-    };
-
+    // Serialize exactly once: the signature must cover the exact bytes sent.
+    let body = serde_json::to_vec(&payload)?;
     let client = reqwest::Client::new();
-    match client
+    let mut request = client
         .post(webhook_url)
         .timeout(Duration::from_secs(10))
-        .json(&payload)
-        .send()
-        .await
-    {
+        .header("Content-Type", "application/json");
+    if let Some(secret) = endpoint.secret.as_deref().filter(|s| !s.is_empty()) {
+        request = request.header("X-Webhook-Signature", auth::webhook_signature(secret, &body));
+    }
+    match request.body(body).send().await {
         Ok(resp) => {
             let status = resp.status().as_u16() as i32;
             if resp.status().is_success() {
@@ -308,7 +479,7 @@ pub async fn deliver_webhook(
                         None,
                     )
                     .await?;
-                info!("Webhook delivered for deposit {deposit_id}");
+                info!("Webhook delivered for {subject_label}");
                 Ok(DeliveryOutcome::Delivered)
             } else {
                 let attempts = delivery.attempts + 1;
@@ -328,10 +499,10 @@ pub async fn deliver_webhook(
                     )
                     .await?;
                 if attempts < WEBHOOK_MAX_ATTEMPTS as i32 {
-                    warn!("Webhook HTTP {status} for deposit {deposit_id} (attempt {attempts})");
+                    warn!("Webhook HTTP {status} for {subject_label} (attempt {attempts})");
                     return Ok(DeliveryOutcome::RetryAt { attempts });
                 }
-                error!("Webhook delivery failed after {attempts} attempts for deposit {deposit_id}");
+                error!("Webhook delivery failed after {attempts} attempts for {subject_label}");
                 Ok(DeliveryOutcome::Failed)
             }
         }
@@ -353,13 +524,35 @@ pub async fn deliver_webhook(
                 )
                 .await?;
             if attempts < WEBHOOK_MAX_ATTEMPTS as i32 {
-                warn!("Webhook error for deposit {deposit_id} (attempt {attempts}): {err}");
+                warn!("Webhook error for {subject_label} (attempt {attempts}): {err}");
                 return Ok(DeliveryOutcome::RetryAt { attempts });
             }
-            error!("Webhook delivery failed after {attempts} attempts for deposit {deposit_id}");
+            error!("Webhook delivery failed after {attempts} attempts for {subject_label}");
             Ok(DeliveryOutcome::Failed)
         }
     }
+}
+
+/// Payload of an address-scoped event. Mirrors the PAID payload's naming:
+/// `data.deposit_id` is deposit_addresses.id.
+fn address_event_payload(
+    event: WebhookEventType,
+    address: &DepositAddressRow,
+) -> Result<serde_json::Value> {
+    let network = Network::from_db(&address.network)?;
+    Ok(serde_json::json!({
+        "event_type": event.payload_event_type(),
+        "data": {
+            "deposit_id": address.id,
+            "address": address.address,
+            "network": network.as_api(),
+            "token": address.token,
+            "expected_amount": address.expected_amount.normalize().to_string(),
+            "status": event.as_api(),
+            "expires_at": address.expires_at.to_rfc3339(),
+            "created_at": address.created_at.to_rfc3339(),
+        },
+    }))
 }
 
 pub fn spawn_workers(state: AppState) {
@@ -414,7 +607,7 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
         return Ok(());
     }
 
-    let _ = state.db.expire_stale_addresses().await?;
+    let _ = expire_addresses_and_notify(state).await?;
     let addresses = state.db.pending_addresses(network).await?;
     if addresses.is_empty() {
         return Ok(());
@@ -486,17 +679,24 @@ async fn webhook_loop(state: AppState) {
             continue;
         }
 
-        let Some((deposit_id, endpoint_id)) = decode_queue_member(&member) else {
+        let Some((event, subject_id, endpoint_id)) = decode_queue_member(&member) else {
             // Legacy member (bare deposit id, pre-multi-endpoint deploy):
-            // fan it out to the current active endpoints.
-            match state.db.active_webhook_endpoints().await {
+            // fan it out to the current active PAID-subscribed endpoints.
+            match state
+                .db
+                .active_webhook_endpoints_for_event(WebhookEventType::Paid)
+                .await
+            {
                 Ok(endpoints) if endpoints.is_empty() => {
                     warn!("Dropping legacy webhook queue member {member} — no active endpoints");
                 }
                 Ok(endpoints) => {
                     info!("Fanning out legacy webhook queue member {member} to {} endpoint(s)", endpoints.len());
                     for endpoint in endpoints {
-                        if let Err(err) = enqueue_webhook(&state, &member, &endpoint.id).await {
+                        if let Err(err) =
+                            enqueue_webhook(&state, WebhookEventType::Paid, &member, &endpoint.id)
+                                .await
+                        {
                             error!("legacy member fan-out error for {member}: {err:#}");
                         }
                     }
@@ -510,14 +710,14 @@ async fn webhook_loop(state: AppState) {
             continue;
         };
 
-        match deliver_webhook(&state, deposit_id, endpoint_id).await {
+        match deliver_webhook(&state, event, subject_id, endpoint_id).await {
             Ok(DeliveryOutcome::RetryAt { attempts }) => {
                 if let Some(delay) = next_retry_delay_secs(attempts) {
                     let score = now + delay as i64;
                     if let Err(err) = redis.zadd::<_, _, _, ()>(&key, &member, score).await {
                         error!("webhook retry schedule error for {member}: {err}");
                     } else {
-                        info!("Webhook attempt {} for deposit {deposit_id} (endpoint {endpoint_id}) rescheduled in {delay}s", attempts + 1);
+                        info!("Webhook attempt {} for {} {subject_id} (endpoint {endpoint_id}) rescheduled in {delay}s", attempts + 1, event.as_api());
                     }
                 }
             }
@@ -763,34 +963,30 @@ pub struct NetworkBalance {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct WebhookPayload {
-    event_type: &'static str,
-    data: WebhookData,
-}
-
-#[derive(Debug, Serialize)]
-struct WebhookData {
-    deposit_id: String,
-    address: String,
-    network: String,
-    token: String,
-    amount: String,
-    amount_raw: String,
-    tx_hash: String,
-    confirmations: i32,
-    status: &'static str,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn queue_member_roundtrip() {
-        let member = encode_queue_member("dep-123", "ep-456");
+    fn paid_queue_member_keeps_legacy_shape() {
+        let member = encode_queue_member(WebhookEventType::Paid, "dep-123", "ep-456");
         assert_eq!(member, "dep-123|ep-456");
-        assert_eq!(decode_queue_member(&member), Some(("dep-123", "ep-456")));
+        assert_eq!(
+            decode_queue_member(&member),
+            Some((WebhookEventType::Paid, "dep-123", "ep-456"))
+        );
+    }
+
+    #[test]
+    fn address_event_queue_member_roundtrip() {
+        for event in [WebhookEventType::Pending, WebhookEventType::Expired] {
+            let member = encode_queue_member(event, "addr-123", "ep-456");
+            assert_eq!(member, format!("{}|addr-123|ep-456", event.as_db()));
+            assert_eq!(
+                decode_queue_member(&member),
+                Some((event, "addr-123", "ep-456"))
+            );
+        }
     }
 
     #[test]
@@ -800,6 +996,10 @@ mod tests {
         assert_eq!(decode_queue_member("|"), None);
         assert_eq!(decode_queue_member("dep|"), None);
         assert_eq!(decode_queue_member("|ep"), None);
+        // Unknown event prefix in a 3-part member is not a valid new-style
+        // member either.
+        assert_eq!(decode_queue_member("BOGUS|addr|ep"), None);
+        assert_eq!(decode_queue_member("a|b|c|d"), None);
     }
 
     #[test]

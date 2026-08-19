@@ -72,20 +72,26 @@ export interface DepositAddressDetail extends DepositAddress {
   deposits: Deposit[]
 }
 
+export type WebhookEventType = "pending" | "paid" | "expired"
+
 export interface WebhookDelivery {
   id: string
-  /** deposits.id — what the retry endpoint expects. */
-  deposit_id: string
+  /** Address lifecycle event this delivery notifies. */
+  event: WebhookEventType
+  /** deposits.id — null on pending/expired event deliveries (no deposit). */
+  deposit_id: string | null
   /** deposit_addresses.id — what the outgoing webhook payload calls deposit_id. */
   deposit_address_id: string
   /** null on deliveries from before per-endpoint tracking. */
   webhook_endpoint_id: string | null
   endpoint_url: string | null
-  tx_hash: string
+  /** null on pending/expired event deliveries. */
+  tx_hash: string | null
   address: string
   network: Network | "unknown"
+  /** Deposit amount for paid events, expected amount otherwise. */
   amount: string
-  deposit_status: DepositStatus
+  deposit_status: DepositStatus | null
   status: WebhookStatus
   attempts: number
   last_response: number | null
@@ -159,6 +165,10 @@ export interface WebhookEndpoint {
   id: string
   url: string
   is_active: boolean
+  /** Events this endpoint receives. */
+  events: WebhookEventType[]
+  /** Whether deliveries are signed (the secret itself is write-only). */
+  has_secret: boolean
   created_by: string | null
   created_at: string
   updated_at: string

@@ -18,6 +18,7 @@ import type {
   WalletBalances,
   WebhookDelivery,
   WebhookEndpoint,
+  WebhookEventType,
 } from "@/lib/types"
 
 function listParams(params: Record<string, string | number | undefined>): string {
@@ -139,6 +140,20 @@ export function useRetryWebhook() {
   })
 }
 
+/** Replay one delivery row — works for every event type. */
+export function useRetryWebhookDelivery() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (deliveryId: string) =>
+      api<{ status: string }>(`/webhook-deliveries/${deliveryId}/retry`, { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["webhooks"] })
+      queryClient.invalidateQueries({ queryKey: ["payments"] })
+      queryClient.invalidateQueries({ queryKey: ["stats"] })
+    },
+  })
+}
+
 export function useRetryAllFailedWebhooks() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -176,7 +191,39 @@ export function useWebhookEndpoints() {
 export function useCreateWebhookEndpoint() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (url: string) => api<WebhookEndpoint>("/webhook-endpoints", { body: { url } }),
+    mutationFn: ({
+      url,
+      events,
+      secret,
+    }: {
+      url: string
+      events: WebhookEventType[]
+      /** Optional signing secret; omitted = unsigned deliveries. */
+      secret?: string
+    }) =>
+      api<WebhookEndpoint>("/webhook-endpoints", {
+        body: { url, events, ...(secret ? { secret } : {}) },
+      }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["webhook-endpoints"] }),
+  })
+}
+
+export function useUpdateWebhookEndpoint() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      ...body
+    }: {
+      id: string
+      events?: WebhookEventType[]
+      /** Non-empty = rotate the signing secret; empty string = remove it. */
+      secret?: string
+    }) =>
+      api<WebhookEndpoint>(`/webhook-endpoints/${id}`, {
+        method: "PATCH",
+        body,
+      }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["webhook-endpoints"] }),
   })
 }

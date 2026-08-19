@@ -5,6 +5,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar"
 
 const TITLES: Array<[string, string]> = [
   ["/payments", "Payments"],
+  ["/deliveries", "Deliveries"],
   ["/webhooks", "Webhooks"],
   ["/wallets", "Wallets"],
   ["/api-keys", "API Keys"],

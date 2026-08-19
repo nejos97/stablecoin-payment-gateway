@@ -6,17 +6,20 @@ use sqlx::FromRow;
 
 use crate::Db;
 
-/// Authoritative delivery row (newest per (deposit, endpoint) pair, same
-/// convention as `find_webhook_delivery`) joined with its deposit, address
-/// and target endpoint. `deposit_id` is `deposits.id` (what the retry
-/// endpoint takes); `deposit_address_id` is `deposit_addresses.id` (what the
-/// webhook payload calls `deposit_id` — intentional, see AGENTS.md).
-/// `webhook_endpoint_id`/`endpoint_url` are NULL on legacy rows.
+/// Authoritative delivery row (newest per logical key — (deposit, endpoint)
+/// for PAID, (address, event, endpoint) for PENDING/EXPIRED) joined with its
+/// deposit (if any), address and target endpoint. `deposit_id` is
+/// `deposits.id` (what the deposit retry endpoint takes) and is NULL on
+/// address-scoped events; `deposit_address_id` is `deposit_addresses.id`
+/// (what the webhook payload calls `deposit_id` — intentional, see
+/// AGENTS.md). `webhook_endpoint_id`/`endpoint_url` are NULL on legacy rows.
 #[derive(Debug, Clone, FromRow)]
 pub struct WebhookDeliveryDetailRow {
     pub id: String,
+    #[sqlx(rename = "eventType")]
+    pub event_type: String,
     #[sqlx(rename = "depositId")]
-    pub deposit_id: String,
+    pub deposit_id: Option<String>,
     #[sqlx(rename = "webhookEndpointId")]
     pub webhook_endpoint_id: Option<String>,
     #[sqlx(rename = "endpointUrl")]
@@ -32,10 +35,12 @@ pub struct WebhookDeliveryDetailRow {
     #[sqlx(rename = "updatedAt")]
     pub updated_at: DateTime<Utc>,
     #[sqlx(rename = "txHash")]
-    pub tx_hash: String,
-    pub amount: Decimal,
+    pub tx_hash: Option<String>,
+    pub amount: Option<Decimal>,
+    #[sqlx(rename = "expectedAmount")]
+    pub expected_amount: Decimal,
     #[sqlx(rename = "depositStatus")]
-    pub deposit_status: String,
+    pub deposit_status: Option<String>,
     #[sqlx(rename = "depositAddressId")]
     pub deposit_address_id: String,
     pub address: String,
@@ -43,20 +48,36 @@ pub struct WebhookDeliveryDetailRow {
 }
 
 const WEBHOOK_DETAIL_INNER: &str = r#"
-    SELECT DISTINCT ON (w."depositId", w."webhookEndpointId")
-        w.id, w."depositId", w."webhookEndpointId", e.url AS "endpointUrl",
+    SELECT DISTINCT ON (w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId")
+        w.id, w."eventType", w."depositId", w."webhookEndpointId", e.url AS "endpointUrl",
         w.status::text AS status, w.attempts,
         w."lastResponse", w."lastError",
         w."createdAt" AT TIME ZONE 'UTC' AS "createdAt",
         w."updatedAt" AT TIME ZONE 'UTC' AS "updatedAt",
         d."txHash", d.amount, d.status::text AS "depositStatus",
-        a.id AS "depositAddressId", a.address, a.network::text AS network
+        a.id AS "depositAddressId", a.address, a.network::text AS network,
+        a."expectedAmount"
     FROM webhook_deliveries w
-    JOIN deposits d ON d.id = w."depositId"
-    JOIN deposit_addresses a ON a.id = d."depositAddressId"
+    LEFT JOIN deposits d ON d.id = w."depositId"
+    JOIN deposit_addresses a ON a.id = w."depositAddressId"
     LEFT JOIN webhook_endpoints e ON e.id = w."webhookEndpointId"
-    ORDER BY w."depositId", w."webhookEndpointId", w."createdAt" DESC
+    ORDER BY w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
 "#;
+
+/// One (delivery key) eligible for a bulk manual retry. `deposit_id` is set
+/// on PAID targets; `webhook_endpoint_id` is `None` on legacy rows (callers
+/// fan those out to all active endpoints).
+#[derive(Debug, Clone, FromRow)]
+pub struct FailedWebhookTarget {
+    #[sqlx(rename = "eventType")]
+    pub event_type: String,
+    #[sqlx(rename = "depositId")]
+    pub deposit_id: Option<String>,
+    #[sqlx(rename = "depositAddressId")]
+    pub deposit_address_id: String,
+    #[sqlx(rename = "webhookEndpointId")]
+    pub webhook_endpoint_id: Option<String>,
+}
 
 /// One day of confirmed-deposit activity for the dashboard chart.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -115,20 +136,20 @@ impl Db {
         Ok((rows, total))
     }
 
-    /// (deposit, endpoint) pairs whose authoritative delivery is FAILED for a
-    /// CONFIRMED deposit — the set eligible for a bulk manual retry. The
-    /// endpoint is `None` on legacy rows (callers fan those out to all active
-    /// endpoints) and inactive endpoints are excluded.
-    pub async fn failed_webhook_targets(&self) -> Result<Vec<(String, Option<String>)>> {
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+    /// Delivery keys whose authoritative delivery is FAILED — the set
+    /// eligible for a bulk manual retry. PAID targets require a CONFIRMED
+    /// deposit; inactive endpoints are excluded.
+    pub async fn failed_webhook_targets(&self) -> Result<Vec<FailedWebhookTarget>> {
+        let rows = sqlx::query_as::<_, FailedWebhookTarget>(
             r#"
-            SELECT t."depositId", t."webhookEndpointId" FROM (
-                SELECT DISTINCT ON (w."depositId", w."webhookEndpointId")
-                    w."depositId", w."webhookEndpointId", w.status::text AS status
+            SELECT t."eventType", t."depositId", t."depositAddressId", t."webhookEndpointId" FROM (
+                SELECT DISTINCT ON (w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId")
+                    w."eventType", w."depositId", w."depositAddressId", w."webhookEndpointId",
+                    w.status::text AS status
                 FROM webhook_deliveries w
-                JOIN deposits d ON d.id = w."depositId"
-                WHERE d.status = 'CONFIRMED'::"DepositStatus"
-                ORDER BY w."depositId", w."webhookEndpointId", w."createdAt" DESC
+                LEFT JOIN deposits d ON d.id = w."depositId"
+                WHERE w."depositId" IS NULL OR d.status = 'CONFIRMED'::"DepositStatus"
+                ORDER BY w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
             ) t
             LEFT JOIN webhook_endpoints e ON e.id = t."webhookEndpointId"
             WHERE t.status = 'FAILED'
@@ -200,13 +221,13 @@ impl Db {
         stats.confirmed_volume = volume;
 
         // Count webhook statuses on authoritative rows only (newest per
-        // (deposit, endpoint) pair).
+        // logical delivery key).
         let webhook_counts: Vec<(String, i64)> = sqlx::query_as(
             r#"
             SELECT t.status, COUNT(*) FROM (
-                SELECT DISTINCT ON ("depositId", "webhookEndpointId") status::text AS status
+                SELECT DISTINCT ON ("depositAddressId", "eventType", "depositId", "webhookEndpointId") status::text AS status
                 FROM webhook_deliveries
-                ORDER BY "depositId", "webhookEndpointId", "createdAt" DESC
+                ORDER BY "depositAddressId", "eventType", "depositId", "webhookEndpointId", "createdAt" DESC
             ) t GROUP BY t.status
             "#,
         )
