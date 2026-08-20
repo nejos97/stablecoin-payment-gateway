@@ -58,6 +58,8 @@ services:
       dockerfile: Dockerfile
     container_name: stablecoin-payment-dashboard
     restart: unless-stopped
+    environment:
+      API_URL: http://api:${PORT:-3000}
     ports:
       - "${DASHBOARD_PORT:-8080}:80"
     depends_on:
