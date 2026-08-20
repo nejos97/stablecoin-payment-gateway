@@ -133,6 +133,22 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Revoke every key created by `staff_id` that is not already revoked —
+    /// used when the account is deactivated. Returns how many were revoked.
+    pub async fn revoke_api_keys_created_by(&self, staff_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE api_keys
+            SET status = 'REVOKED'::"ApiKeyStatus", "revokedAt" = NOW()
+            WHERE "createdById" = $1 AND "revokedAt" IS NULL
+            "#,
+        )
+        .bind(staff_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Materialize the EXPIRED status for keys whose deadline has passed.
     /// Lookup already rejects them; this keeps listings and stats honest.
     pub async fn expire_stale_api_keys(&self) -> Result<u64> {

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::Db;
 
-const STAFF_USER_COLUMNS: &str = r#"id, email, "firstName", "lastName", "passwordHash", role::text AS role, "isActive", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const STAFF_USER_COLUMNS: &str = r#"id, email, "firstName", "lastName", "passwordHash", role::text AS role, "isActive", "totpSecret", "totpEnabledAt" AT TIME ZONE 'UTC' AS "totpEnabledAt", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct StaffUserRow {
@@ -21,10 +21,20 @@ pub struct StaffUserRow {
     pub role: String,
     #[sqlx(rename = "isActive")]
     pub is_active: bool,
+    #[sqlx(rename = "totpSecret")]
+    pub totp_secret: Option<String>,
+    #[sqlx(rename = "totpEnabledAt")]
+    pub totp_enabled_at: Option<DateTime<Utc>>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
     pub updated_at: DateTime<Utc>,
+}
+
+impl StaffUserRow {
+    pub fn totp_enabled(&self) -> bool {
+        self.totp_secret.is_some() && self.totp_enabled_at.is_some()
+    }
 }
 
 impl Db {
@@ -168,6 +178,41 @@ impl Db {
         .bind(role.map(|r| r.as_db()))
         .bind(is_active)
         .bind(password_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn enable_staff_totp(&self, id: &str, secret: &str) -> Result<Option<StaffUserRow>> {
+        let row = sqlx::query_as::<_, StaffUserRow>(&format!(
+            r#"
+            UPDATE staff_users
+            SET "totpSecret" = $2,
+                "totpEnabledAt" = NOW(),
+                "updatedAt" = NOW()
+            WHERE id = $1
+            RETURNING {STAFF_USER_COLUMNS}
+            "#
+        ))
+        .bind(id)
+        .bind(secret)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn clear_staff_totp(&self, id: &str) -> Result<Option<StaffUserRow>> {
+        let row = sqlx::query_as::<_, StaffUserRow>(&format!(
+            r#"
+            UPDATE staff_users
+            SET "totpSecret" = NULL,
+                "totpEnabledAt" = NULL,
+                "updatedAt" = NOW()
+            WHERE id = $1
+            RETURNING {STAFF_USER_COLUMNS}
+            "#
+        ))
+        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)

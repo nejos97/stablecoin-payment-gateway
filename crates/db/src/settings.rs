@@ -1,10 +1,11 @@
 use anyhow::Result;
-use config::DEPOSIT_EXPIRY_DEFAULT_MINUTES;
+use config::{DEPOSIT_EXPIRY_DEFAULT_MINUTES, TOTP_ISSUER};
 
 use crate::Db;
 
 pub const DEPOSIT_EXPIRY_SETTING: &str = "depositExpiryMinutes";
 pub const API_KEY_PREFIX_SETTING: &str = "apiKeyPrefix";
+pub const TOTP_ISSUER_SETTING: &str = "totpIssuer";
 
 impl Db {
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -38,6 +39,17 @@ impl Db {
         Ok(value
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty()))
+    }
+
+    /// Issuer shown by authenticator apps for TOTP enrollments,
+    /// admin-configurable from the dashboard. Falls back to the code default
+    /// when unset or blank.
+    pub async fn totp_issuer(&self) -> Result<String> {
+        let value = self.get_setting(TOTP_ISSUER_SETTING).await?;
+        Ok(value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| TOTP_ISSUER.to_string()))
     }
 
     /// Default payment-address expiry, admin-configurable from the dashboard.

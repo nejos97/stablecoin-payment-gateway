@@ -15,6 +15,7 @@ import type {
   DepositAddressDetail,
   Paginated,
   Staff,
+  TotpSetup,
   WalletBalances,
   WebhookDelivery,
   WebhookEndpoint,
@@ -304,6 +305,53 @@ export function useUpdateStaff() {
   return useMutation({
     mutationFn: ({ id, ...payload }: UpdateStaffPayload) =>
       api<Staff>(`/staff/${id}`, { method: "PATCH", body: payload }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["staff"] })
+      // Deactivating a member revokes every API key they created.
+      queryClient.invalidateQueries({ queryKey: ["api-keys"] })
+    },
+  })
+}
+
+export function useMe() {
+  return useQuery({
+    queryKey: ["me"],
+    queryFn: () => api<Staff>("/auth/me"),
+  })
+}
+
+export function useTotpSetup() {
+  return useMutation({
+    mutationFn: () => api<TotpSetup>("/auth/totp/setup", { method: "POST" }),
+  })
+}
+
+export function useEnableTotp() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (code: string) => api<Staff>("/auth/totp/enable", { body: { code } }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["me"] })
+      queryClient.invalidateQueries({ queryKey: ["staff"] })
+    },
+  })
+}
+
+export function useDisableTotp() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (code: string) => api<Staff>("/auth/totp/disable", { body: { code } }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["me"] })
+      queryClient.invalidateQueries({ queryKey: ["staff"] })
+    },
+  })
+}
+
+export function useResetStaffTotp() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => api<Staff>(`/staff/${id}/totp/reset`, { method: "POST" }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["staff"] }),
   })
 }

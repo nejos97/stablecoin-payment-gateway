@@ -25,11 +25,13 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
     let public = Router::new()
         .route("/setup", get(get_setup).post(post_setup))
         .route("/auth/login", post(login))
+        .route("/auth/login/totp", post(login_totp))
         .route("/auth/refresh", post(refresh));
 
     let admin_only = Router::new()
         .route("/staff", get(list_staff).post(create_staff))
         .route("/staff/{id}", patch(update_staff))
+        .route("/staff/{id}/totp/reset", post(reset_staff_totp))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/{id}", delete(revoke_api_key))
         .route("/settings", get(get_settings).patch(update_settings))
@@ -46,6 +48,9 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
     let authed = Router::new()
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/auth/totp/setup", post(totp_setup))
+        .route("/auth/totp/enable", post(totp_enable))
+        .route("/auth/totp/disable", post(totp_disable))
         .route("/webhooks", get(list_webhooks))
         .route("/webhooks/retry-failed", post(retry_failed))
         .route(
@@ -129,12 +134,119 @@ async fn login(
     if !auth::verify_password(&body.password, &staff.password_hash) {
         return Err(ApiError::unauthorized("Invalid email or password"));
     }
+
+    // Second factor: hand out a short-lived single-use MFA token instead of
+    // the session — /auth/login/totp exchanges it plus a valid code. The
+    // deactivation notice is deliberately only shown once every credential
+    // (password AND code) has been proven, so it leaks nothing to guessers;
+    // for a 2FA account it therefore comes from /auth/login/totp instead.
+    if staff.totp_enabled() {
+        let (mfa_token, mfa_hash) = auth::generate_refresh_token();
+        let key = state.config.redis_key(&format!("auth:mfa:{mfa_hash}"));
+        let mut redis = state.redis.clone();
+        let _: () = redis.set_ex(key, &staff.id, MFA_TOKEN_TTL_SECS).await?;
+        return Ok(Json(json!({
+            "mfa_required": true,
+            "mfa_token": mfa_token,
+        })));
+    }
+
     if !staff.is_active {
-        return Err(ApiError::unauthorized("Account is deactivated"));
+        return Err(ApiError::forbidden(
+            "Your account is not active — please contact an administrator",
+        ));
     }
 
     let tokens = issue_token_pair(&state, &staff).await?;
     Ok(Json(tokens))
+}
+
+/// Lifetime of the password-proven login challenge.
+const MFA_TOKEN_TTL_SECS: u64 = 300;
+/// Wrong codes tolerated per MFA token before it is destroyed.
+const MFA_MAX_ATTEMPTS: i64 = 5;
+/// Anti-replay memory; must outlive the ±1-period skew window.
+const TOTP_REPLAY_TTL_SECS: u64 = 120;
+
+#[derive(Debug, Deserialize)]
+struct LoginTotpRequest {
+    mfa_token: String,
+    code: String,
+}
+
+async fn login_totp(
+    State(state): State<AppState>,
+    Json(body): Json<LoginTotpRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let hash = auth::sha256_hex(&body.mfa_token);
+    let key = state.config.redis_key(&format!("auth:mfa:{hash}"));
+    let attempts_key = state.config.redis_key(&format!("auth:mfa:attempts:{hash}"));
+    let mut redis = state.redis.clone();
+
+    let staff_id: Option<String> = redis.get(&key).await?;
+    let Some(staff_id) = staff_id else {
+        return Err(ApiError::unauthorized("Invalid or expired login session"));
+    };
+
+    let attempts: i64 = redis.incr(&attempts_key, 1).await?;
+    if attempts == 1 {
+        let _: () = redis.expire(&attempts_key, MFA_TOKEN_TTL_SECS as i64).await?;
+    }
+    if attempts > MFA_MAX_ATTEMPTS {
+        let _: () = redis.del(&key).await?;
+        let _: () = redis.del(&attempts_key).await?;
+        return Err(ApiError::unauthorized(
+            "Too many incorrect codes — sign in again",
+        ));
+    }
+
+    let Some(staff) = state.db.find_staff_by_id(&staff_id).await? else {
+        return Err(ApiError::unauthorized("Unknown staff user"));
+    };
+    let Some(secret) = staff.totp_secret.as_deref().filter(|_| staff.totp_enabled()) else {
+        return Err(ApiError::unauthorized("Invalid or expired login session"));
+    };
+
+    // A wrong code does NOT consume the token: a typo shouldn't force the
+    // password step again. The attempt counter above bounds brute force.
+    verify_totp_code(&state, &staff.id, secret, &body.code)
+        .await?
+        .ok_or_else(|| ApiError::unauthorized("Invalid authentication code"))?;
+
+    let _: () = redis.del(&key).await?;
+    let _: () = redis.del(&attempts_key).await?;
+
+    // Both factors are proven — only now reveal that the account is blocked.
+    if !staff.is_active {
+        return Err(ApiError::forbidden(
+            "Your account is not active — please contact an administrator",
+        ));
+    }
+
+    let tokens = issue_token_pair(&state, &staff).await?;
+    Ok(Json(tokens))
+}
+
+/// Verify a TOTP code with replay protection: a code is only accepted for a
+/// timestep strictly newer than the last one used by this staff member.
+/// Returns the matched counter, or `None` on wrong/reused codes.
+async fn verify_totp_code(
+    state: &AppState,
+    staff_id: &str,
+    secret: &str,
+    code: &str,
+) -> Result<Option<i64>, ApiError> {
+    let Some(counter) = auth::verify_totp(secret, code.trim(), Utc::now().timestamp()) else {
+        return Ok(None);
+    };
+    let key = state.config.redis_key(&format!("auth:totp:last:{staff_id}"));
+    let mut redis = state.redis.clone();
+    let last: Option<i64> = redis.get(&key).await?;
+    if last.is_some_and(|last| counter <= last) {
+        return Ok(None);
+    }
+    let _: () = redis.set_ex(key, counter, TOTP_REPLAY_TTL_SECS).await?;
+    Ok(Some(counter))
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +293,107 @@ async fn logout(
 
 async fn me(Extension(staff): Extension<CurrentStaff>, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let Some(row) = state.db.find_staff_by_id(&staff.id).await? else {
+        return Err(ApiError::unauthorized("Unknown staff user"));
+    };
+    Ok(Json(staff_to_json(&row)))
+}
+
+/// Pending (generated but unconfirmed) TOTP secrets live only in Redis, so
+/// abandoned setups expire on their own and nothing half-enrolled hits the DB.
+const TOTP_PENDING_TTL_SECS: u64 = 600;
+
+async fn totp_setup(
+    Extension(current): Extension<CurrentStaff>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(staff) = state.db.find_staff_by_id(&current.id).await? else {
+        return Err(ApiError::unauthorized("Unknown staff user"));
+    };
+    if staff.totp_enabled() {
+        return Err(ApiError::conflict(
+            "Two-factor authentication is already enabled",
+        ));
+    }
+
+    let secret = auth::generate_totp_secret();
+    let key = state.config.redis_key(&format!("auth:totp:pending:{}", staff.id));
+    let mut redis = state.redis.clone();
+    let _: () = redis.set_ex(key, &secret, TOTP_PENDING_TTL_SECS).await?;
+
+    let issuer = state.db.totp_issuer().await?;
+    let otpauth_url = auth::totp_otpauth_url(&secret, &staff.email, &issuer);
+    Ok(Json(json!({
+        "secret": secret,
+        "otpauth_url": otpauth_url,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct TotpCodeRequest {
+    code: String,
+}
+
+async fn totp_enable(
+    Extension(current): Extension<CurrentStaff>,
+    State(state): State<AppState>,
+    Json(body): Json<TotpCodeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(staff) = state.db.find_staff_by_id(&current.id).await? else {
+        return Err(ApiError::unauthorized("Unknown staff user"));
+    };
+    if staff.totp_enabled() {
+        return Err(ApiError::conflict(
+            "Two-factor authentication is already enabled",
+        ));
+    }
+
+    let key = state.config.redis_key(&format!("auth:totp:pending:{}", staff.id));
+    let mut redis = state.redis.clone();
+    let secret: Option<String> = redis.get(&key).await?;
+    let Some(secret) = secret else {
+        return Err(ApiError::bad_request(
+            "No pending 2FA setup — generate a QR code first",
+        ));
+    };
+
+    // 400, never 401: on authed routes the dashboard treats 401 as an
+    // expired session and would log the user out over a typo.
+    if verify_totp_code(&state, &staff.id, &secret, &body.code)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::bad_request("Invalid authentication code"));
+    }
+
+    let Some(row) = state.db.enable_staff_totp(&staff.id, &secret).await? else {
+        return Err(ApiError::unauthorized("Unknown staff user"));
+    };
+    let _: () = redis.del(&key).await?;
+    Ok(Json(staff_to_json(&row)))
+}
+
+async fn totp_disable(
+    Extension(current): Extension<CurrentStaff>,
+    State(state): State<AppState>,
+    Json(body): Json<TotpCodeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(staff) = state.db.find_staff_by_id(&current.id).await? else {
+        return Err(ApiError::unauthorized("Unknown staff user"));
+    };
+    let Some(secret) = staff.totp_secret.as_deref().filter(|_| staff.totp_enabled()) else {
+        return Err(ApiError::bad_request(
+            "Two-factor authentication is not enabled",
+        ));
+    };
+
+    if verify_totp_code(&state, &staff.id, secret, &body.code)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::bad_request("Invalid authentication code"));
+    }
+
+    let Some(row) = state.db.clear_staff_totp(&staff.id).await? else {
         return Err(ApiError::unauthorized("Unknown staff user"));
     };
     Ok(Json(staff_to_json(&row)))
@@ -263,6 +476,13 @@ async fn update_staff(
         return Err(ApiError::bad_request("You cannot deactivate your own account"));
     }
 
+    // Only non-admin staff can be deactivated; demote an admin first.
+    if body.is_active == Some(false) && target.role == StaffRole::Admin.as_db() {
+        return Err(ApiError::bad_request(
+            "Admin accounts cannot be deactivated — demote them to operator first",
+        ));
+    }
+
     // Never let the instance end up without an active admin.
     let target_is_active_admin = target.role == StaffRole::Admin.as_db() && target.is_active;
     let loses_admin = role == Some(StaffRole::Operator) || body.is_active == Some(false);
@@ -305,11 +525,44 @@ async fn update_staff(
 
     // Blocking must be immediate: besides `require_jwt` rejecting inactive
     // accounts, drop every stored refresh session of the blocked staff so a
-    // saved refresh token cannot be replayed later.
+    // saved refresh token cannot be replayed later. Their API keys are
+    // revoked too (revocation is permanent — reactivating the account does
+    // not resurrect them).
     if body.is_active == Some(false) {
         revoke_staff_sessions(&state, &row.id).await?;
+        state.db.revoke_api_keys_created_by(&row.id).await?;
     }
 
+    Ok(Json(staff_to_json(&row)))
+}
+
+/// Recovery path for a lost authenticator: an admin removes another staff
+/// member's 2FA. Their sessions are revoked too — a reset usually means the
+/// device is lost or compromised. Admins cannot reset their own 2FA here
+/// (that would bypass the code-required disable on the Account page).
+async fn reset_staff_totp(
+    Extension(current): Extension<CurrentStaff>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if id == current.id {
+        return Err(ApiError::bad_request(
+            "Use the Account page to disable your own 2FA",
+        ));
+    }
+    let Some(staff) = state.db.find_staff_by_id(&id).await? else {
+        return Err(ApiError::not_found(format!("Staff user not found: {id}")));
+    };
+    if !staff.totp_enabled() {
+        return Err(ApiError::bad_request(
+            "Two-factor authentication is not enabled for this user",
+        ));
+    }
+
+    let Some(row) = state.db.clear_staff_totp(&id).await? else {
+        return Err(ApiError::not_found(format!("Staff user not found: {id}")));
+    };
+    revoke_staff_sessions(&state, &row.id).await?;
     Ok(Json(staff_to_json(&row)))
 }
 
@@ -452,7 +705,11 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<Value>, ApiE
 struct UpdateSettingsRequest {
     deposit_expiry_minutes: Option<i64>,
     api_key_prefix: Option<String>,
+    totp_issuer: Option<String>,
 }
+
+/// Keep the otpauth label reasonable — authenticator apps truncate long ones.
+const TOTP_ISSUER_MAX_LEN: usize = 40;
 
 async fn update_settings(
     State(state): State<AppState>,
@@ -485,15 +742,30 @@ async fn update_settings(
         state.db.set_setting(db::API_KEY_PREFIX_SETTING, prefix).await?;
     }
 
+    if let Some(issuer) = body.totp_issuer.as_deref() {
+        // Empty string resets to the code default; the stored value only
+        // affects NEW enrollments (existing authenticator entries keep the
+        // label they were created with).
+        let issuer = issuer.trim();
+        if issuer.chars().count() > TOTP_ISSUER_MAX_LEN {
+            return Err(ApiError::bad_request(
+                "totp_issuer must be at most 40 characters (empty to reset)",
+            ));
+        }
+        state.db.set_setting(db::TOTP_ISSUER_SETTING, issuer).await?;
+    }
+
     settings_json(&state).await
 }
 
 async fn settings_json(state: &AppState) -> Result<Json<Value>, ApiError> {
     let minutes = state.db.deposit_expiry_minutes().await?;
     let api_key_prefix = state.db.api_key_prefix().await?;
+    let totp_issuer = state.db.totp_issuer().await?;
     Ok(Json(json!({
         "deposit_expiry_minutes": minutes,
         "api_key_prefix": api_key_prefix,
+        "totp_issuer": totp_issuer,
     })))
 }
 
@@ -879,6 +1151,7 @@ fn staff_to_json(row: &StaffUserRow) -> Value {
         "last_name": row.last_name,
         "role": StaffRole::from_db(&row.role).map(|r| r.as_api()).unwrap_or("operator"),
         "is_active": row.is_active,
+        "totp_enabled": row.totp_enabled(),
         "created_at": row.created_at.to_rfc3339(),
     })
 }

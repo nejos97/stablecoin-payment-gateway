@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom"
 
 import { AppLayout } from "@/components/layout/AppLayout"
 import { RequireAdmin, RequireAuth } from "@/lib/auth"
+import { AccountSecurityPage } from "@/pages/AccountSecurityPage"
 import { ApiKeysPage } from "@/pages/ApiKeysPage"
 import { DeliveriesPage } from "@/pages/DeliveriesPage"
 import { LoginPage } from "@/pages/LoginPage"
@@ -26,6 +27,7 @@ export default function App() {
           <Route path="/payments/:id" element={<PaymentDetailPage />} />
           <Route path="/deliveries" element={<DeliveriesPage />} />
           <Route path="/wallets" element={<WalletsPage />} />
+          <Route path="/account/2fa" element={<AccountSecurityPage />} />
           <Route element={<RequireAdmin />}>
             <Route path="/api-keys" element={<ApiKeysPage />} />
             <Route path="/webhooks" element={<WebhooksPage />} />

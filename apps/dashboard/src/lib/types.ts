@@ -7,6 +7,7 @@ export interface Staff {
   last_name: string
   role: StaffRole
   is_active: boolean
+  totp_enabled: boolean
   created_at: string
 }
 
@@ -14,6 +15,18 @@ export interface AuthResponse {
   access_token: string
   refresh_token: string
   staff: Staff
+}
+
+export interface MfaChallenge {
+  mfa_required: true
+  mfa_token: string
+}
+
+export type LoginResult = AuthResponse | MfaChallenge
+
+export interface TotpSetup {
+  secret: string
+  otpauth_url: string
 }
 
 export interface Paginated<T> {
@@ -155,12 +168,16 @@ export interface WalletBalances {
 export interface AppSettings {
   deposit_expiry_minutes: number
   api_key_prefix: string | null
+  /** Effective value — the default is returned when nothing is configured. */
+  totp_issuer: string
 }
 
 /** PATCH /settings is partial — only provided fields are updated. */
 export type AppSettingsUpdate = Partial<{
   deposit_expiry_minutes: number
   api_key_prefix: string
+  /** Empty string resets to the default issuer. */
+  totp_issuer: string
 }>
 
 export interface WebhookEndpoint {

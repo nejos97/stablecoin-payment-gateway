@@ -16,7 +16,7 @@ mod webhook_endpoints;
 
 pub use admin_queries::{AdminStats, DailyDepositStat, WebhookDeliveryDetailRow};
 pub use api_keys::{ApiKeyListRow, ApiKeyRow};
-pub use settings::{API_KEY_PREFIX_SETTING, DEPOSIT_EXPIRY_SETTING};
+pub use settings::{API_KEY_PREFIX_SETTING, DEPOSIT_EXPIRY_SETTING, TOTP_ISSUER_SETTING};
 pub use staff::StaffUserRow;
 pub use webhook_endpoints::{WebhookEndpointListRow, WebhookEndpointRow};
 

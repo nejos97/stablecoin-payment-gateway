@@ -172,6 +172,91 @@ pub fn webhook_signature(secret: &str, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
+/// TOTP parameters follow the authenticator-app defaults (Google
+/// Authenticator, Authy, 1Password): SHA-1, 30-second period, 6 digits.
+pub const TOTP_PERIOD_SECS: i64 = 30;
+pub const TOTP_DIGITS: u32 = 6;
+/// Accepted clock skew, in periods, on each side of "now".
+pub const TOTP_SKEW_STEPS: i64 = 1;
+const TOTP_SECRET_BYTES: usize = 20;
+
+/// Fresh TOTP secret: 20 random bytes, RFC 4648 base32 without padding —
+/// the format authenticator apps expect in `otpauth://` URLs.
+pub fn generate_totp_secret() -> String {
+    let mut bytes = [0u8; TOTP_SECRET_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &bytes)
+}
+
+/// Verify a 6-digit code against the secret at `unix_time`, allowing
+/// ±`TOTP_SKEW_STEPS` periods of clock skew. Returns the matched timestep
+/// counter — the caller persists it to reject replays within the skew
+/// window — or `None` on mismatch, malformed code, or invalid secret.
+pub fn verify_totp(secret_base32: &str, code: &str, unix_time: i64) -> Option<i64> {
+    if code.len() != TOTP_DIGITS as usize || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let counter = unix_time.div_euclid(TOTP_PERIOD_SECS);
+    let mut matched = None;
+    for candidate in (counter - TOTP_SKEW_STEPS)..=(counter + TOTP_SKEW_STEPS) {
+        let expected = totp_code_at(secret_base32, candidate)?;
+        if bool::from(expected.as_bytes().ct_eq(code.as_bytes())) {
+            matched = Some(candidate);
+        }
+    }
+    matched
+}
+
+/// The `otpauth://` provisioning URL encoded into the enrollment QR code.
+pub fn totp_otpauth_url(secret_base32: &str, email: &str, issuer: &str) -> String {
+    let issuer = totp_url_encode(issuer);
+    let email = totp_url_encode(email);
+    format!(
+        "otpauth://totp/{issuer}:{email}?secret={secret_base32}&issuer={issuer}\
+         &algorithm=SHA1&digits={TOTP_DIGITS}&period={TOTP_PERIOD_SECS}"
+    )
+}
+
+/// RFC 6238: HOTP (RFC 4226 dynamic truncation of HMAC-SHA-1 over the
+/// big-endian timestep counter) reduced mod 10^digits, zero-padded.
+fn totp_code_at(secret_base32: &str, counter: i64) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    let key = base32::decode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        secret_base32.trim(),
+    )?;
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&key).ok()?;
+    mac.update(&counter.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[19] & 0x0f) as usize;
+    let binary = u32::from_be_bytes([
+        digest[offset] & 0x7f,
+        digest[offset + 1],
+        digest[offset + 2],
+        digest[offset + 3],
+    ]);
+    Some(format!(
+        "{:01$}",
+        binary % 10u32.pow(TOTP_DIGITS),
+        TOTP_DIGITS as usize
+    ))
+}
+
+/// Minimal percent-encoding for otpauth URL components (RFC 3986 unreserved
+/// characters pass through).
+fn totp_url_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn random_alphanumeric(len: usize) -> String {
     OsRng
         .sample_iter(&Alphanumeric)
@@ -273,6 +358,70 @@ mod tests {
         assert_eq!(h1, sha256_hex(&t1));
         assert!(constant_time_eq_hex(&h1, &sha256_hex(&t1)));
         assert!(!constant_time_eq_hex(&h1, &h2));
+    }
+
+    /// "12345678901234567890" (the RFC 6238 SHA-1 test secret) in base32.
+    const RFC6238_SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    #[test]
+    fn totp_matches_rfc6238_appendix_b_vectors() {
+        // RFC 6238 Appendix B SHA-1 vectors, truncated from 8 to 6 digits.
+        for (time, code) in [
+            (59, "287082"),
+            (1_111_111_109, "081804"),
+            (1_111_111_111, "050471"),
+            (1_234_567_890, "005924"),
+            (2_000_000_000, "279037"),
+        ] {
+            assert_eq!(
+                verify_totp(RFC6238_SECRET, code, time),
+                Some(time / TOTP_PERIOD_SECS),
+                "T={time}"
+            );
+        }
+    }
+
+    #[test]
+    fn totp_skew_window() {
+        // T=1111111111 → counter 37037037, code 050471. The previous and next
+        // periods accept it; ±2 periods reject it.
+        let code = "050471";
+        assert_eq!(
+            verify_totp(RFC6238_SECRET, code, 1_111_111_111 + 30),
+            Some(37_037_037)
+        );
+        assert_eq!(
+            verify_totp(RFC6238_SECRET, code, 1_111_111_111 - 30),
+            Some(37_037_037)
+        );
+        assert_eq!(verify_totp(RFC6238_SECRET, code, 1_111_111_111 + 60), None);
+        assert_eq!(verify_totp(RFC6238_SECRET, code, 1_111_111_111 - 60), None);
+    }
+
+    #[test]
+    fn totp_rejects_malformed_codes_and_secrets() {
+        assert_eq!(verify_totp(RFC6238_SECRET, "05047", 1_111_111_111), None);
+        assert_eq!(verify_totp(RFC6238_SECRET, "0504712", 1_111_111_111), None);
+        assert_eq!(verify_totp(RFC6238_SECRET, "abcdef", 1_111_111_111), None);
+        assert_eq!(verify_totp("not!base32", "050471", 1_111_111_111), None);
+    }
+
+    #[test]
+    fn totp_secret_shape() {
+        let secret = generate_totp_secret();
+        assert_eq!(secret.len(), 32); // 20 bytes → 32 base32 chars, no padding
+        assert_ne!(secret, generate_totp_secret());
+        assert!(base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret).is_some());
+    }
+
+    #[test]
+    fn otpauth_url_is_encoded() {
+        let url = totp_otpauth_url("ABC234", "user@example.com", "My Gateway");
+        assert_eq!(
+            url,
+            "otpauth://totp/My%20Gateway:user%40example.com?secret=ABC234\
+             &issuer=My%20Gateway&algorithm=SHA1&digits=6&period=30"
+        );
     }
 
     #[test]

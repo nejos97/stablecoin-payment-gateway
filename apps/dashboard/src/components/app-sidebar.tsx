@@ -6,6 +6,7 @@ import {
   ReceiptTextIcon,
   SendIcon,
   SettingsIcon,
+  ShieldCheckIcon,
   UsersIcon,
   WalletIcon,
   WebhookIcon,
@@ -40,6 +41,11 @@ const NAV_ADMIN: NavItem[] = [
   { title: "Webhooks", url: "/webhooks", icon: <WebhookIcon /> },
   { title: "Staff", url: "/staff", icon: <UsersIcon /> },
   { title: "Settings", url: "/settings", icon: <SettingsIcon /> },
+]
+
+// Visible to every role — each staff member manages their own account here.
+const NAV_ACCOUNT: NavItem[] = [
+  { title: "2FA", url: "/account/2fa", icon: <ShieldCheckIcon /> },
 ]
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
@@ -88,6 +94,27 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
             </SidebarGroupContent>
           </SidebarGroup>
         )}
+        <SidebarGroup>
+          <SidebarGroupLabel>Account</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {NAV_ACCOUNT.map((item) => (
+                <SidebarMenuItem key={item.title}>
+                  <SidebarMenuButton
+                    asChild
+                    tooltip={item.title}
+                    isActive={location.pathname.startsWith(item.url)}
+                  >
+                    <Link to={item.url}>
+                      {item.icon}
+                      <span>{item.title}</span>
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
       </SidebarContent>
       <SidebarFooter>
         <NavUser />

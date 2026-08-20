@@ -1,6 +1,14 @@
 import { useState } from "react"
 import { zodResolver } from "@hookform/resolvers/zod"
-import { Ban, CircleCheck, MoreHorizontal, Plus, UserCog } from "lucide-react"
+import {
+  Ban,
+  CircleCheck,
+  MoreHorizontal,
+  Plus,
+  ShieldCheck,
+  ShieldOff,
+  UserCog,
+} from "lucide-react"
 import { useForm } from "react-hook-form"
 import { toast } from "sonner"
 import { z } from "zod"
@@ -52,7 +60,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { useCreateStaff, useStaffList, useUpdateStaff } from "@/hooks/queries"
+import {
+  useCreateStaff,
+  useResetStaffTotp,
+  useStaffList,
+  useUpdateStaff,
+} from "@/hooks/queries"
 import { useAuth } from "@/lib/auth"
 import { formatDate, initials } from "@/lib/format"
 import type { Staff } from "@/lib/types"
@@ -61,8 +74,10 @@ export function StaffPage() {
   const { staff: me } = useAuth()
   const staffList = useStaffList()
   const updateStaff = useUpdateStaff()
+  const resetStaffTotp = useResetStaffTotp()
   const [editing, setEditing] = useState<Staff | null>(null)
   const [blocking, setBlocking] = useState<Staff | null>(null)
+  const [resettingTotp, setResettingTotp] = useState<Staff | null>(null)
 
   async function blockMember(member: Staff) {
     try {
@@ -74,6 +89,19 @@ export function StaffPage() {
       toast.error(error instanceof Error ? error.message : "Blocking failed")
     } finally {
       setBlocking(null)
+    }
+  }
+
+  async function resetMemberTotp(member: Staff) {
+    try {
+      await resetStaffTotp.mutateAsync(member.id)
+      toast.success(
+        `2FA removed for ${member.first_name} ${member.last_name} — their sessions were revoked`,
+      )
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Reset failed")
+    } finally {
+      setResettingTotp(null)
     }
   }
 
@@ -111,6 +139,7 @@ export function StaffPage() {
                 <TableHead>Member</TableHead>
                 <TableHead>Role</TableHead>
                 <TableHead>Status</TableHead>
+                <TableHead>2FA</TableHead>
                 <TableHead>Created</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
@@ -118,7 +147,7 @@ export function StaffPage() {
             <TableBody>
               {staffList.data?.data.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={5} className="h-24 text-center text-muted-foreground">
+                  <TableCell colSpan={6} className="h-24 text-center text-muted-foreground">
                     No staff accounts found.
                   </TableCell>
                 </TableRow>
@@ -149,6 +178,15 @@ export function StaffPage() {
                   <TableCell>
                     <StatusBadge status={member.is_active ? "active" : "blocked"} />
                   </TableCell>
+                  <TableCell>
+                    {member.totp_enabled ? (
+                      <span className="inline-flex items-center gap-1 text-sm">
+                        <ShieldCheck className="size-3.5 text-emerald-600" /> Enabled
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
+                    )}
+                  </TableCell>
                   <TableCell className="text-muted-foreground">
                     {formatDate(member.created_at)}
                   </TableCell>
@@ -163,14 +201,21 @@ export function StaffPage() {
                         <DropdownMenuItem onClick={() => setEditing(member)}>
                           <UserCog /> Edit
                         </DropdownMenuItem>
+                        {member.id !== me?.id && member.totp_enabled && (
+                          <DropdownMenuItem onClick={() => setResettingTotp(member)}>
+                            <ShieldOff /> Reset 2FA
+                          </DropdownMenuItem>
+                        )}
                         {member.id !== me?.id &&
                           (member.is_active ? (
-                            <DropdownMenuItem
-                              variant="destructive"
-                              onClick={() => setBlocking(member)}
-                            >
-                              <Ban /> Block
-                            </DropdownMenuItem>
+                            member.role !== "admin" && (
+                              <DropdownMenuItem
+                                variant="destructive"
+                                onClick={() => setBlocking(member)}
+                              >
+                                <Ban /> Block
+                              </DropdownMenuItem>
+                            )
                           ) : (
                             <DropdownMenuItem onClick={() => unblockMember(member)}>
                               <CircleCheck /> Unblock
@@ -190,6 +235,32 @@ export function StaffPage() {
         <EditStaffDialog member={editing} onClose={() => setEditing(null)} />
       )}
 
+      <AlertDialog
+        open={resettingTotp !== null}
+        onOpenChange={(open) => !open && setResettingTotp(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Reset 2FA for {resettingTotp?.first_name} {resettingTotp?.last_name}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Their two-factor authentication will be removed and all their
+              sessions revoked. They can sign in with their password only and
+              re-enroll from the Account page.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => resettingTotp && resetMemberTotp(resettingTotp)}
+            >
+              Reset 2FA
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <AlertDialog open={blocking !== null} onOpenChange={(open) => !open && setBlocking(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -198,7 +269,8 @@ export function StaffPage() {
             </AlertDialogTitle>
             <AlertDialogDescription>
               They will be signed out immediately and unable to log in until an
-              admin unblocks them. Their account and history are kept.
+              admin unblocks them. Every API key they created is permanently
+              revoked. Their account and history are kept.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

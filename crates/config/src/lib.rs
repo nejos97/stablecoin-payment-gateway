@@ -23,6 +23,9 @@ pub const API_KEY_EXPIRY_ALLOWED_DAYS: [i64; 4] = [30, 90, 180, 365];
 /// Expired keys are rejected at lookup time immediately; this sweep only
 /// materializes the EXPIRED status for listings and stats.
 pub const API_KEY_EXPIRY_SWEEP_INTERVAL_SECS: u64 = 300;
+/// Default issuer shown by authenticator apps for staff TOTP enrollments;
+/// admins can override it from the dashboard Settings (`app_settings`).
+pub const TOTP_ISSUER: &str = "Stablecoin Payment Gateway";
 
 pub const USDT_ETH: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 pub const USDT_TRON: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";

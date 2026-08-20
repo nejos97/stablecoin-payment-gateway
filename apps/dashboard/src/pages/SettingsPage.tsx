@@ -1,6 +1,9 @@
+import { useEffect, useState } from "react"
+import { ShieldCheck } from "lucide-react"
 import { toast } from "sonner"
 
 import { QueryError } from "@/components/shared/QueryError"
+import { Button } from "@/components/ui/button"
 import {
   Card,
   CardContent,
@@ -8,6 +11,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
@@ -34,11 +38,81 @@ export function SettingsPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">
-          System configuration — payment expiry.
+          System configuration — payment expiry, two-factor authentication.
         </p>
       </div>
       <PaymentExpiryCard />
+      <TotpIssuerCard />
     </div>
+  )
+}
+
+const DEFAULT_TOTP_ISSUER = "Stablecoin Payment Gateway"
+
+function TotpIssuerCard() {
+  const settings = useSettings()
+  const updateSettings = useUpdateSettings()
+  const [issuer, setIssuer] = useState("")
+
+  useEffect(() => {
+    if (settings.data) setIssuer(settings.data.totp_issuer)
+  }, [settings.data])
+
+  const saved = settings.data?.totp_issuer ?? ""
+  const dirty = issuer.trim() !== saved
+
+  async function save() {
+    // An empty (or default-equal) value resets the stored setting so the
+    // backend falls back to its default.
+    const next = issuer.trim() === DEFAULT_TOTP_ISSUER ? "" : issuer.trim()
+    try {
+      const updated = await updateSettings.mutateAsync({ totp_issuer: next })
+      toast.success(`Authenticator apps will now show “${updated.totp_issuer}”`)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Update failed")
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Two-factor issuer</CardTitle>
+        <CardDescription>
+          Name shown by authenticator apps next to staff 2FA codes. Applies to
+          new enrollments only — existing entries keep their label. Leave empty
+          to use the default “{DEFAULT_TOTP_ISSUER}”.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {settings.isError ? (
+          <QueryError error={settings.error} />
+        ) : settings.isLoading ? (
+          <Skeleton className="h-9 w-64" />
+        ) : (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <Input
+                className="w-72"
+                maxLength={40}
+                placeholder={DEFAULT_TOTP_ISSUER}
+                value={issuer}
+                onChange={(event) => setIssuer(event.target.value)}
+                aria-label="Two-factor issuer"
+              />
+              <Button onClick={save} disabled={!dirty || updateSettings.isPending} size="sm">
+                {updateSettings.isPending ? "Saving…" : "Save"}
+              </Button>
+            </div>
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <ShieldCheck className="size-3.5 shrink-0" />
+              <span>
+                Shown as <code className="text-xs">{issuer.trim() || DEFAULT_TOTP_ISSUER}: user@company.com</code>
+              </span>
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 

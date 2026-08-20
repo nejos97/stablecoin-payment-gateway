@@ -18,7 +18,7 @@ import {
   setOnSessionExpired,
   setRefreshToken,
 } from "@/lib/api"
-import type { AuthResponse, Staff } from "@/lib/types"
+import type { AuthResponse, LoginResult, Staff } from "@/lib/types"
 
 interface SetupPayload {
   email: string
@@ -31,7 +31,9 @@ interface AuthContextValue {
   staff: Staff | null
   loading: boolean
   needsSetup: boolean
-  login: (email: string, password: string) => Promise<void>
+  /** Resolves to an MFA challenge when 2FA is required, null when signed in. */
+  login: (email: string, password: string) => Promise<{ mfaToken: string } | null>
+  loginTotp: (mfaToken: string, code: string) => Promise<void>
   completeSetup: (payload: SetupPayload) => Promise<void>
   logout: () => Promise<void>
 }
@@ -89,8 +91,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(
     async (email: string, password: string) => {
-      const auth = await api<AuthResponse>("/auth/login", {
+      const result = await api<LoginResult>("/auth/login", {
         body: { email, password },
+        anonymous: true,
+      })
+      if ("mfa_required" in result) {
+        return { mfaToken: result.mfa_token }
+      }
+      applyAuth(result)
+      return null
+    },
+    [applyAuth],
+  )
+
+  const loginTotp = useCallback(
+    async (mfaToken: string, code: string) => {
+      const auth = await api<AuthResponse>("/auth/login/totp", {
+        body: { mfa_token: mfaToken, code },
         anonymous: true,
       })
       applyAuth(auth)
@@ -119,8 +136,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [clearSession])
 
   const value = useMemo(
-    () => ({ staff, loading, needsSetup, login, completeSetup, logout }),
-    [staff, loading, needsSetup, login, completeSetup, logout],
+    () => ({ staff, loading, needsSetup, login, loginTotp, completeSetup, logout }),
+    [staff, loading, needsSetup, login, loginTotp, completeSetup, logout],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

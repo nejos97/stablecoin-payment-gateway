@@ -11,6 +11,7 @@ const TITLES: Array<[string, string]> = [
   ["/api-keys", "API Keys"],
   ["/staff", "Staff"],
   ["/settings", "Settings"],
+  ["/account", "Account"],
 ]
 
 export function SiteHeader() {

@@ -40,8 +40,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rust_decimal = { version = "1", features = ["serde-with-str", "serde-float"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
+base32 = "0.5"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "rust_decimal", "uuid", "json", "migrate"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
