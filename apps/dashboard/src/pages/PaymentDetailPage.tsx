@@ -1,4 +1,5 @@
-import { ArrowLeft, RefreshCw } from "lucide-react"
+import { ArrowLeft, QrCode, RefreshCw } from "lucide-react"
+import { QRCodeSVG } from "qrcode.react"
 import { Link, useParams } from "react-router-dom"
 import { toast } from "sonner"
 
@@ -12,6 +13,16 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   Table,
@@ -23,6 +34,38 @@ import {
 } from "@/components/ui/table"
 import { usePayment, useRetryWebhook } from "@/hooks/queries"
 import { formatAmount, formatDate, networkLabel, shortHash } from "@/lib/format"
+
+function AddressQrDialog({ address, label }: { address: string; label: string }) {
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        <Button variant="outline" size="sm">
+          <QrCode className="size-3.5" /> View QR Code
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle>Deposit address</DialogTitle>
+          <DialogDescription>{label}</DialogDescription>
+        </DialogHeader>
+        <div className="flex justify-center py-2">
+          {/* White backing so the QR scans in dark mode too. */}
+          <div className="rounded-lg bg-white p-3">
+            <QRCodeSVG value={address} size={224} />
+          </div>
+        </div>
+        <code className="break-all text-center text-xs text-muted-foreground">
+          {address}
+        </code>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button variant="outline">Close</Button>
+          </DialogClose>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
 
 export function PaymentDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -84,6 +127,10 @@ export function PaymentDetailPage() {
               <code className="break-all text-sm">{data.address}</code>
               <CopyButton value={data.address} />
             </div>
+            <AddressQrDialog
+              address={data.address}
+              label={`${networkLabel(data.network)} · ${data.token}`}
+            />
             <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
               <dt className="text-muted-foreground">Expected amount</dt>
               <dd className="tabular-nums">{formatAmount(data.expected_amount, data.token)}</dd>
